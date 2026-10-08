@@ -330,18 +330,10 @@ internal class JellyfinMigrationService
                         if (_backupKey.JellyfinDb is not null)
                         {
                             migrationLogger.LogInformation("Attempt to rollback JellyfinDb.");
-                            try
-                            {
-                                var restoreResult = await _jellyfinDatabaseProvider.TryRestoreBackupFast(_backupKey.JellyfinDb, CancellationToken.None).ConfigureAwait(false);
-                                if (!restoreResult.Succeeded)
-                                {
-                                    throw new InvalidOperationException(restoreResult.ErrorMessage ?? "The database provider could not restore the fast migration backup.");
-                                }
-                            }
-                            catch (Exception inner)
-                            {
-                                migrationLogger.LogCritical(inner, "Could not rollback {LibraryPath}. Manual intervention might be required to restore a operational state.", _backupKey.JellyfinDb);
-                            }
+                            await TryRestoreJellyfinDatabaseBackup(
+                                _jellyfinDatabaseProvider,
+                                _backupKey.JellyfinDb,
+                                migrationLogger).ConfigureAwait(false);
                         }
 
                         if (_backupKey.FullBackup is not null)
@@ -393,18 +385,10 @@ internal class JellyfinMigrationService
             if (_backupKey.JellyfinDb is not null && _jellyfinDatabaseProvider is not null)
             {
                 logger.LogInformation("Attempt to cleanup JellyfinDb backup.");
-                try
-                {
-                    var deleteResult = await _jellyfinDatabaseProvider.TryDeleteBackup(_backupKey.JellyfinDb).ConfigureAwait(false);
-                    if (!deleteResult.Succeeded)
-                    {
-                        logger.LogCritical("Could not cleanup JellyfinDb backup: {ErrorMessage}", deleteResult.ErrorMessage);
-                    }
-                }
-                catch (Exception inner)
-                {
-                    logger.LogCritical(inner, "Could not cleanup {LibraryPath}.", _backupKey.JellyfinDb);
-                }
+                await TryDeleteJellyfinDatabaseBackup(
+                    _jellyfinDatabaseProvider,
+                    _backupKey.JellyfinDb,
+                    logger).ConfigureAwait(false);
             }
 
             if (_backupKey.FullBackup is not null)
@@ -420,6 +404,61 @@ internal class JellyfinMigrationService
                 }
             }
         }
+    }
+
+    internal static async Task<bool> TryRestoreJellyfinDatabaseBackup(
+        IJellyfinDatabaseProvider databaseProvider,
+        string backupKey,
+        ILogger logger)
+    {
+        try
+        {
+            var result = await databaseProvider.TryRestoreBackupFast(backupKey, CancellationToken.None).ConfigureAwait(false);
+            if (result.Succeeded)
+            {
+                return true;
+            }
+
+            logger.LogCritical(
+                "Could not rollback {BackupKey}: {ErrorMessage}. Manual intervention might be required to restore an operational state.",
+                backupKey,
+                result.ErrorMessage ?? "The database provider could not restore the fast migration backup.");
+        }
+        catch (Exception ex)
+        {
+            logger.LogCritical(
+                ex,
+                "Could not rollback {BackupKey}. Manual intervention might be required to restore an operational state.",
+                backupKey);
+        }
+
+        return false;
+    }
+
+    internal static async Task<bool> TryDeleteJellyfinDatabaseBackup(
+        IJellyfinDatabaseProvider databaseProvider,
+        string backupKey,
+        ILogger logger)
+    {
+        try
+        {
+            var result = await databaseProvider.TryDeleteBackup(backupKey).ConfigureAwait(false);
+            if (result.Succeeded)
+            {
+                return true;
+            }
+
+            logger.LogCritical(
+                "Could not cleanup JellyfinDb backup {BackupKey}: {ErrorMessage}",
+                backupKey,
+                result.ErrorMessage ?? "The database provider could not delete the fast migration backup.");
+        }
+        catch (Exception ex)
+        {
+            logger.LogCritical(ex, "Could not cleanup JellyfinDb backup {BackupKey}.", backupKey);
+        }
+
+        return false;
     }
 
     public async Task PrepareSystemForMigration(ILogger logger)

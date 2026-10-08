@@ -3,6 +3,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
@@ -134,6 +135,8 @@ public sealed class BackupServiceTests : IDisposable
         await using var manifestStream = await manifestEntry.OpenAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
         using var document = await JsonDocument.ParseAsync(manifestStream, cancellationToken: TestContext.Current.CancellationToken).ConfigureAwait(true);
         Assert.Equal(DatabaseProviderKey.Sqlite, document.RootElement.GetProperty("DatabaseProvider").GetString());
+        Assert.Equal("0.3.0", document.RootElement.GetProperty("BackupEngineVersion").GetString());
+        Assert.NotEqual("0.2.0", document.RootElement.GetProperty("BackupEngineVersion").GetString());
     }
 
     [Fact]
@@ -182,6 +185,80 @@ public sealed class BackupServiceTests : IDisposable
             Times.Never);
     }
 
+    [Fact]
+    public async Task RestoreBackupAsync_LegacySqliteArchiveWithoutDatabaseConfiguration_ReachesPurge()
+    {
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto()).ConfigureAwait(true);
+        await RewriteManifest(manifest.Path, new Version(0, 2, 0), null).ConfigureAwait(true);
+        var provider = CreateDatabaseProvider(DatabaseProviderKey.Sqlite, DatabaseProviderCapabilities.FullSystemRestore);
+        provider
+            .Setup(p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()))
+            .ThrowsAsync(new InvalidOperationException("purge reached"));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => CreateBackupService(provider).RestoreBackupAsync(manifest.Path));
+
+        Assert.Equal("purge reached", exception.Message);
+        provider.Verify(
+            p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_LegacyPluginArchiveWithMatchingAssembly_ReachesPurgeWithoutNewCapabilities()
+    {
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto()).ConfigureAwait(true);
+        await RewriteManifest(manifest.Path, new Version(0, 2, 0), null).ConfigureAwait(true);
+        var provider = CreateDatabaseProvider("Legacy.Plugin.Provider", DatabaseProviderCapabilities.None);
+        await AddPluginDatabaseConfiguration(
+            manifest.Path,
+            provider.Object.GetType().Assembly.GetName().Name!).ConfigureAwait(true);
+        provider
+            .Setup(p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()))
+            .ThrowsAsync(new InvalidOperationException("purge reached"));
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => CreateBackupService(provider).RestoreBackupAsync(manifest.Path));
+
+        Assert.Equal("purge reached", exception.Message);
+        provider.Verify(
+            p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()),
+            Times.Once);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_LegacyPluginArchiveWithAmbiguousIdentity_RejectsBeforePurge()
+    {
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto()).ConfigureAwait(true);
+        await RewriteManifest(manifest.Path, new Version(0, 2, 0), null).ConfigureAwait(true);
+        await AddPluginDatabaseConfiguration(manifest.Path, "Different.Database.Plugin").ConfigureAwait(true);
+        var provider = CreateDatabaseProvider("Legacy.Plugin.Provider", DatabaseProviderCapabilities.None);
+
+        var exception = await Assert.ThrowsAsync<NotSupportedException>(
+            () => CreateBackupService(provider).RestoreBackupAsync(manifest.Path));
+
+        Assert.Contains("cannot be matched safely", exception.Message, StringComparison.Ordinal);
+        provider.Verify(
+            p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_ProviderTaggedLegacyVersion_RejectsBeforePurge()
+    {
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto()).ConfigureAwait(true);
+        await RewriteManifest(manifest.Path, new Version(0, 2, 0), DatabaseProviderKey.Sqlite).ConfigureAwait(true);
+        var provider = CreateDatabaseProvider(DatabaseProviderKey.Sqlite, DatabaseProviderCapabilities.FullSystemRestore);
+
+        var exception = await Assert.ThrowsAsync<NotSupportedException>(
+            () => CreateBackupService(provider).RestoreBackupAsync(manifest.Path));
+
+        Assert.Contains("requires backup format version 0.3.0", exception.Message, StringComparison.Ordinal);
+        provider.Verify(
+            p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()),
+            Times.Never);
+    }
+
     private BackupService CreateBackupService(Mock<IJellyfinDatabaseProvider>? jellyfinDatabaseProvider = null)
     {
         var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
@@ -195,6 +272,8 @@ public sealed class BackupServiceTests : IDisposable
         applicationPaths.Setup(a => a.BackupPath).Returns(_backupPath);
         applicationPaths.Setup(a => a.ConfigurationDirectoryPath).Returns(_configurationDirectoryPath);
         applicationPaths.Setup(a => a.DataPath).Returns(Path.Combine(_testRoot, "Data"));
+        applicationPaths.Setup(a => a.CachePath).Returns(Path.Combine(_testRoot, "Cache"));
+        applicationPaths.Setup(a => a.ProgramDataPath).Returns(Path.Combine(_testRoot, "ProgramData"));
         applicationPaths.Setup(a => a.RootFolderPath).Returns(Path.Combine(_testRoot, "Root"));
         applicationPaths.Setup(a => a.InternalMetadataPath).Returns(Path.Combine(_testRoot, "Metadata"));
         applicationPaths.Setup(a => a.DefaultInternalMetadataPath).Returns(Path.Combine(_testRoot, "MetadataDefault"));
@@ -226,6 +305,58 @@ public sealed class BackupServiceTests : IDisposable
         provider.Setup(p => p.RunScheduledOptimisation(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
         provider.Setup(p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>())).Returns(Task.CompletedTask);
         return provider;
+    }
+
+    private static async Task RewriteManifest(string archivePath, Version backupEngineVersion, string? databaseProvider)
+    {
+        using var archive = await ZipFile.OpenAsync(
+            archivePath,
+            ZipArchiveMode.Update,
+            TestContext.Current.CancellationToken).ConfigureAwait(true);
+        var manifestEntry = archive.GetEntry("manifest.json");
+        Assert.NotNull(manifestEntry);
+
+        JsonObject manifest;
+        await using (var manifestStream = await manifestEntry.OpenAsync(TestContext.Current.CancellationToken).ConfigureAwait(true))
+        {
+            manifest = (JsonObject)(await JsonNode.ParseAsync(
+                manifestStream,
+                cancellationToken: TestContext.Current.CancellationToken).ConfigureAwait(true))!;
+        }
+
+        manifestEntry.Delete();
+        manifest["BackupEngineVersion"] = backupEngineVersion.ToString();
+        if (databaseProvider is null)
+        {
+            manifest.Remove("DatabaseProvider");
+        }
+        else
+        {
+            manifest["DatabaseProvider"] = databaseProvider;
+        }
+
+        var replacement = archive.CreateEntry("manifest.json");
+        await using var replacementStream = await replacement.OpenAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        await JsonSerializer.SerializeAsync(
+            replacementStream,
+            manifest,
+            cancellationToken: TestContext.Current.CancellationToken).ConfigureAwait(true);
+    }
+
+    private static async Task AddPluginDatabaseConfiguration(string archivePath, string pluginAssembly)
+    {
+        using var archive = await ZipFile.OpenAsync(
+            archivePath,
+            ZipArchiveMode.Update,
+            TestContext.Current.CancellationToken).ConfigureAwait(true);
+        var configurationEntry = archive.CreateEntry("Config/database.xml");
+        await using var configurationStream = await configurationEntry.OpenAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        await using var writer = new StreamWriter(configurationStream);
+        await writer.WriteAsync(
+            ($"<DatabaseConfigurationOptions><DatabaseType>{DatabaseProviderKey.Plugin}</DatabaseType>"
+            + $"<CustomProviderOptions><PluginAssembly>{pluginAssembly}</PluginAssembly></CustomProviderOptions>"
+            + "</DatabaseConfigurationOptions>").AsMemory(),
+            TestContext.Current.CancellationToken).ConfigureAwait(true);
     }
 
     private static BaseItemEntity CreateMovieEntity(Guid id, string name)

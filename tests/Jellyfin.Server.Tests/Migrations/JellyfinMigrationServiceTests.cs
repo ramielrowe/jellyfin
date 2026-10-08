@@ -160,6 +160,102 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
         provider.Verify(p => p.MigrationBackupFast(It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    [Fact]
+    public async Task TryRestoreJellyfinDatabaseBackup_WhenProviderSucceeds_ReturnsTrue()
+    {
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider
+            .Setup(p => p.TryRestoreBackupFast("backup", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DatabaseProviderOperationResult.Success());
+
+        var result = await JellyfinMigrationService.TryRestoreJellyfinDatabaseBackup(
+            provider.Object,
+            "backup",
+            NullLogger.Instance);
+
+        Assert.True(result);
+    }
+
+    [Fact]
+    public async Task TryRestoreJellyfinDatabaseBackup_WhenProviderReportsFailure_ReturnsFalse()
+    {
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider
+            .Setup(p => p.TryRestoreBackupFast("backup", It.IsAny<CancellationToken>()))
+            .ReturnsAsync(DatabaseProviderOperationResult.Failure("restore failed"));
+
+        var result = await JellyfinMigrationService.TryRestoreJellyfinDatabaseBackup(
+            provider.Object,
+            "backup",
+            NullLogger.Instance);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task TryRestoreJellyfinDatabaseBackup_WhenProviderThrows_ReturnsFalse()
+    {
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider
+            .Setup(p => p.TryRestoreBackupFast("backup", It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new IOException("restore failed"));
+
+        var result = await JellyfinMigrationService.TryRestoreJellyfinDatabaseBackup(
+            provider.Object,
+            "backup",
+            NullLogger.Instance);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task TryDeleteJellyfinDatabaseBackup_WhenProviderSucceeds_ReturnsTrue()
+    {
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider
+            .Setup(p => p.TryDeleteBackup("backup"))
+            .ReturnsAsync(DatabaseProviderOperationResult.Success());
+
+        var result = await JellyfinMigrationService.TryDeleteJellyfinDatabaseBackup(
+            provider.Object,
+            "backup",
+            NullLogger.Instance);
+
+        Assert.True(result);
+    }
+
+    [Fact]
+    public async Task TryDeleteJellyfinDatabaseBackup_WhenProviderReportsFailure_ReturnsFalse()
+    {
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider
+            .Setup(p => p.TryDeleteBackup("backup"))
+            .ReturnsAsync(DatabaseProviderOperationResult.Failure("delete failed"));
+
+        var result = await JellyfinMigrationService.TryDeleteJellyfinDatabaseBackup(
+            provider.Object,
+            "backup",
+            NullLogger.Instance);
+
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task TryDeleteJellyfinDatabaseBackup_WhenProviderThrows_ReturnsFalse()
+    {
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider
+            .Setup(p => p.TryDeleteBackup("backup"))
+            .ThrowsAsync(new IOException("delete failed"));
+
+        var result = await JellyfinMigrationService.TryDeleteJellyfinDatabaseBackup(
+            provider.Object,
+            "backup",
+            NullLogger.Instance);
+
+        Assert.False(result);
+    }
+
     public void Dispose()
     {
         foreach (var serviceProvider in _serviceProviders)

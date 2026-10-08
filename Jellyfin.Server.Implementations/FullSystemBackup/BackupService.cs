@@ -8,7 +8,9 @@ using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Xml.Linq;
 using Jellyfin.Database.Implementations;
+using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Server.Implementations.StorageHelpers;
 using Jellyfin.Server.Implementations.SystemBackupService;
 using MediaBrowser.Controller;
@@ -28,6 +30,7 @@ namespace Jellyfin.Server.Implementations.FullSystemBackup;
 public class BackupService : IBackupService
 {
     private const string ManifestEntryName = "manifest.json";
+    private const string DatabaseConfigurationEntryName = "Config/database.xml";
     private readonly ILogger<BackupService> _logger;
     private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
     private readonly IServerApplicationHost _applicationHost;
@@ -41,7 +44,8 @@ public class BackupService : IBackupService
         ReferenceHandler = ReferenceHandler.IgnoreCycles,
     };
 
-    private readonly Version _backupEngineVersion = new Version(0, 2, 0);
+    private static readonly Version _backupEngineVersion = new(0, 3, 0);
+    private static readonly Version _legacyBackupEngineVersion = new(0, 2, 0);
 
     /// <summary>
     /// Initializes a new instance of the <see cref="BackupService"/> class.
@@ -118,10 +122,10 @@ public class BackupService : IBackupService
 
             if (!TestBackupVersionCompatibility(manifest.BackupEngineVersion))
             {
-                throw new NotSupportedException($"The loaded archive '{archivePath}' is made for a newer version of Jellyfin ({manifest.ServerVersion}) and cannot be loaded in this version.");
+                throw new NotSupportedException($"The loaded archive '{archivePath}' uses unsupported backup format version {manifest.BackupEngineVersion}.");
             }
 
-            ValidateDatabaseRestore(manifest, archivePath);
+            ValidateDatabaseRestore(manifest, zipArchive, archivePath);
             StorageHelper.TestCommonPathsForStorageCapacity(_applicationPaths, _logger);
 
             void CopyDirectory(string source, string target, string[]? exclude = null)
@@ -258,38 +262,105 @@ public class BackupService : IBackupService
 
     private bool TestBackupVersionCompatibility(Version backupEngineVersion)
     {
-        if (backupEngineVersion == _backupEngineVersion)
-        {
-            return true;
-        }
-
-        return false;
+        return backupEngineVersion == _backupEngineVersion || backupEngineVersion == _legacyBackupEngineVersion;
     }
 
-    private void ValidateDatabaseRestore(BackupManifest manifest, string archivePath)
+    private void ValidateDatabaseRestore(BackupManifest manifest, ZipArchive archive, string archivePath)
     {
         if (!manifest.Options.Database)
         {
             return;
         }
 
-        if (!_jellyfinDatabaseProvider.Capabilities.HasFlag(DatabaseProviderCapabilities.FullSystemRestore))
+        if (manifest.DatabaseProvider is not null && manifest.BackupEngineVersion != _backupEngineVersion)
         {
             throw new NotSupportedException(
-                $"Database provider '{_jellyfinDatabaseProvider.ProviderKey}' does not support full-system database restore. "
-                + "Restore the database using a provider-supported procedure or restore an archive without database contents.");
+                $"The loaded archive '{archivePath}' records a database provider but uses backup format version {manifest.BackupEngineVersion}. "
+                + "The provider-aware database format requires backup format version 0.3.0.");
         }
 
-        // Provider identity was added after the first full-system backup format. All older archives were produced by
-        // the only built-in provider at the time, SQLite.
-        var archiveProvider = manifest.DatabaseProvider ?? DatabaseProviderKey.Sqlite;
+        var legacyPluginRestore = false;
+        var archiveProvider = manifest.DatabaseProvider;
+        if (archiveProvider is null)
+        {
+            if (manifest.BackupEngineVersion != _legacyBackupEngineVersion)
+            {
+                throw new NotSupportedException(
+                    $"The loaded archive '{archivePath}' does not identify the database provider that created it.");
+            }
+
+            (archiveProvider, legacyPluginRestore) = ResolveLegacyDatabaseProvider(archive, archivePath);
+        }
+
         if (!string.Equals(archiveProvider, _jellyfinDatabaseProvider.ProviderKey, StringComparison.OrdinalIgnoreCase))
         {
             throw new NotSupportedException(
                 $"The loaded archive '{archivePath}' contains a database backup for provider '{archiveProvider}', "
                 + $"but the configured provider is '{_jellyfinDatabaseProvider.ProviderKey}'. Cross-provider database restore is not supported.");
         }
+
+        // Old plugin providers could restore version 0.2 backups before capabilities existed. Preserve that path only
+        // after the archived plugin assembly has been matched to the assembly of the provider that is actually loaded.
+        if (!_jellyfinDatabaseProvider.Capabilities.HasFlag(DatabaseProviderCapabilities.FullSystemRestore)
+            && !legacyPluginRestore)
+        {
+            throw new NotSupportedException(
+                $"Database provider '{_jellyfinDatabaseProvider.ProviderKey}' does not support full-system database restore. "
+                + "Restore the database using a provider-supported procedure or restore an archive without database contents.");
+        }
     }
+
+    private (string ProviderKey, bool LegacyPluginRestore) ResolveLegacyDatabaseProvider(ZipArchive archive, string archivePath)
+    {
+        var configurationEntry = archive.GetEntry(DatabaseConfigurationEntryName);
+        if (configurationEntry is null)
+        {
+            // A plugin provider could not have been selected without database.xml. Its absence therefore identifies
+            // the historical built-in default, SQLite.
+            return (DatabaseProviderKey.Sqlite, false);
+        }
+
+        XDocument configuration;
+        try
+        {
+            using var configurationStream = configurationEntry.Open();
+            configuration = XDocument.Load(configurationStream);
+        }
+        catch (Exception ex)
+        {
+            throw new NotSupportedException(
+                $"The loaded legacy archive '{archivePath}' contains an unreadable database configuration, so its database provider cannot be identified safely.",
+                ex);
+        }
+
+        var databaseType = GetConfigurationValue(configuration, nameof(DatabaseConfigurationOptions.DatabaseType));
+        if (string.IsNullOrWhiteSpace(databaseType))
+        {
+            throw new NotSupportedException(
+                $"The loaded legacy archive '{archivePath}' does not identify its database type, so restoring its database is unsafe.");
+        }
+
+        if (!string.Equals(databaseType, DatabaseProviderKey.Plugin, StringComparison.OrdinalIgnoreCase))
+        {
+            return (databaseType, false);
+        }
+
+        var pluginAssembly = GetConfigurationValue(configuration, nameof(CustomDatabaseOptions.PluginAssembly));
+        var loadedAssembly = _jellyfinDatabaseProvider.GetType().Assembly.GetName().Name;
+        if (string.IsNullOrWhiteSpace(pluginAssembly)
+            || string.IsNullOrWhiteSpace(loadedAssembly)
+            || !string.Equals(Path.GetFileNameWithoutExtension(pluginAssembly), loadedAssembly, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new NotSupportedException(
+                $"The loaded legacy archive '{archivePath}' was created by a plugin database provider that cannot be matched safely to the configured provider. "
+                + "Restore it with the same database plugin version or use a provider-supported procedure.");
+        }
+
+        return (_jellyfinDatabaseProvider.ProviderKey, true);
+    }
+
+    private static string? GetConfigurationValue(XDocument configuration, string localName)
+        => configuration.Descendants().FirstOrDefault(e => string.Equals(e.Name.LocalName, localName, StringComparison.Ordinal))?.Value;
 
     /// <inheritdoc/>
     public async Task<BackupManifestDto> CreateBackupAsync(BackupOptionsDto backupOptions)
