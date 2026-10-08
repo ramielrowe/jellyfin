@@ -123,6 +123,34 @@ public class PostgreSqlDatabaseProviderTests
     }
 
     [Fact]
+    public void ExternalMigrationBackupAcknowledgement_MustMatchNewestPendingMigration()
+    {
+        const string TargetMigration = "20261008114025_AddActivityLogTypeDateIndex";
+        var optionsBuilder = new DbContextOptionsBuilder<JellyfinDbContext>();
+        var provider = new PostgreSqlDatabaseProvider(Mock.Of<ILogger<PostgreSqlDatabaseProvider>>());
+        var configuration = CreateConfiguration(ConnectionString);
+        configuration.CustomProviderOptions!.Options = new Collection<CustomDatabaseOption>
+        {
+            new()
+            {
+                Key = "MIGRATION-BACKUP-ACKNOWLEDGEMENT",
+                Value = TargetMigration
+            }
+        };
+        provider.Initialise(optionsBuilder, configuration);
+
+        var accepted = provider.ValidateExternalMigrationBackupAcknowledgement(
+            ["20261008095117_InitialPostgreSqlBaseline", TargetMigration]);
+        var rejected = provider.ValidateExternalMigrationBackupAcknowledgement(
+            [TargetMigration, "20261101000000_LaterMigration"]);
+
+        Assert.True(accepted.Succeeded);
+        Assert.False(rejected.Succeeded);
+        Assert.Contains(PostgreSqlDatabaseProviderOptions.MigrationBackupAcknowledgement, rejected.ErrorMessage, StringComparison.Ordinal);
+        Assert.Contains("20261101000000_LaterMigration", rejected.ErrorMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Initialise_MalformedConnectionString_DoesNotExposePassword()
     {
         const string Password = "correct horse battery staple";

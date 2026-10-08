@@ -47,6 +47,18 @@ PostgreSQL does not advertise Jellyfin fast-migration backup or full-system data
 administrator's native PostgreSQL backup and restore procedure. Jellyfin rejects its logical database restore before
 purging data because that path cannot currently reseed every imported identity sequence safely.
 
+An existing PostgreSQL database with pending migrations stops before mutation unless its `database.xml` contains a
+`CustomProviderOptions.Options` entry named `migration-backup-acknowledgement` whose value is the newest pending
+migration id. Set that value only after creating and verifying an administrator-managed PostgreSQL backup for that
+specific upgrade. A stale acknowledgement does not authorize a later upgrade, and Jellyfin cannot automatically
+restore the external backup if a migration fails.
+
+`PostgreSqlStartupLifecycleTests` runs through the production pre-start and core migration services. It proves an
+empty pre-created database can start and restart, upgrades a checked-in predecessor migration state while preserving
+representative related data, and exercises credential, connectivity, schema-permission, incompatible-schema, and
+missing-backup-acknowledgement failures. These scenarios are PostgreSQL-to-PostgreSQL only; a SQLite database or
+backup is not an input to them and changing `DatabaseType` does not migrate SQLite data.
+
 Do not use production credentials or point this test harness at a production server. Connection strings and credentials are not written to test output.
 
 ## Behavioral provider matrix

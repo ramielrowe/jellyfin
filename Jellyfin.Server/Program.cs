@@ -321,7 +321,7 @@ namespace Jellyfin.Server
                 .AddSingleton<ServerApplicationPaths>(appPaths)
                 .RegisterStartupLogger();
 
-            var startupService = migrationStartupServiceProvider.BuildServiceProvider();
+            using var startupService = migrationStartupServiceProvider.BuildServiceProvider();
 
             PrepareDatabaseProvider(startupService);
 

@@ -38,6 +38,8 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
 
     public string SanitizedConnectionString => RedactConnectionString(_connectionString);
 
+    internal string ConnectionString => _connectionString;
+
     public static async Task<PostgreSqlTestDatabase> CreateAsync(
         string administratorConnectionString,
         string runtimeConnectionString,
@@ -277,6 +279,33 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         command.CommandText = "SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = $1)";
         command.Parameters.AddWithValue(schemaName);
         return (bool)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+    }
+
+    public string BuildConnectionString(Action<NpgsqlConnectionStringBuilder> configure)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(configure);
+        var builder = new NpgsqlConnectionStringBuilder(_connectionString);
+        configure(builder);
+        return builder.ConnectionString;
+    }
+
+    public async Task DenyRuntimeSchemaAccessAsync(CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var administratorBuilder = new NpgsqlConnectionStringBuilder(_administratorConnectionString)
+        {
+            Database = DatabaseName,
+            Pooling = false
+        };
+        var runtimeBuilder = new NpgsqlConnectionStringBuilder(_connectionString);
+        await using var dataSource = NpgsqlDataSource.Create(administratorBuilder.ConnectionString);
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "ALTER SCHEMA public OWNER TO " + QuoteIdentifier(administratorBuilder.Username!)
+            + "; REVOKE ALL ON SCHEMA public FROM PUBLIC; REVOKE ALL ON SCHEMA public FROM "
+            + QuoteIdentifier(runtimeBuilder.Username!);
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
     public static string CreateDatabaseName()

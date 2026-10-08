@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Globalization;
 using System.Linq;
 using System.Threading;
@@ -20,9 +21,10 @@ namespace Jellyfin.Database.Providers.PostgreSql;
 /// Configures Jellyfin to use a PostgreSQL database.
 /// </summary>
 [JellyfinDatabaseProviderKey(DatabaseProviderKey.PostgreSql)]
-public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
+public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider, IDatabaseProviderMigrationPolicy
 {
     private readonly ILogger<PostgreSqlDatabaseProvider> _logger;
+    private string? _migrationBackupAcknowledgement;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PostgreSqlDatabaseProvider"/> class.
@@ -75,6 +77,8 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         }
 
         var commandTimeout = GetCommandTimeout(databaseConfiguration.CustomProviderOptions?.Options);
+        _migrationBackupAcknowledgement = databaseConfiguration.CustomProviderOptions?.Options.FirstOrDefault(
+            option => option.Key.Equals(PostgreSqlDatabaseProviderOptions.MigrationBackupAcknowledgement, StringComparison.OrdinalIgnoreCase))?.Value;
 
         _logger.LogInformation(
             "PostgreSQL database configured at {Host}:{Port} for database {Database}",
@@ -175,6 +179,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         activityLogs.Property(entity => entity.Overview).UseCollation("C");
         activityLogs.Property(entity => entity.ShortOverview).UseCollation("C");
         activityLogs.Property(entity => entity.Type).UseCollation("C");
+        activityLogs.HasIndex(entity => new { entity.Type, entity.DateCreated });
 
         var users = modelBuilder.Entity<User>();
         users.Property(entity => entity.Username).UseCollation("C");
@@ -330,6 +335,109 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     }
 
     /// <inheritdoc/>
+    public async Task<bool> IsDatabaseEmptyForInitialMigrationAsync(
+        JellyfinDbContext dbContext,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(dbContext);
+
+        // The pre-start migration phase creates only EF's history table before the production host builds its
+        // second service provider. Ignore that one known table, but treat every other user object as data that must
+        // not receive an initial baseline without a backup or an explicit operator decision.
+        var connection = dbContext.Database.GetDbConnection();
+        var closeConnection = connection.State is not ConnectionState.Open;
+        if (closeConnection)
+        {
+            await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        try
+        {
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT NOT EXISTS (
+                    SELECT 1
+                    FROM pg_class AS object_record
+                    JOIN pg_namespace AS namespace_record ON namespace_record.oid = object_record.relnamespace
+                    WHERE namespace_record.nspname <> 'information_schema'
+                        AND namespace_record.nspname !~ '^pg_'
+                        AND object_record.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+                        AND object_record.relname <> '__EFMigrationsHistory')
+                """;
+            return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is true;
+        }
+        finally
+        {
+            if (closeConnection)
+            {
+                await connection.CloseAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    public DatabaseProviderOperationResult ValidateExternalMigrationBackupAcknowledgement(
+        IReadOnlyCollection<string> pendingMigrationIds)
+    {
+        ArgumentNullException.ThrowIfNull(pendingMigrationIds);
+        if (pendingMigrationIds.Count == 0)
+        {
+            return DatabaseProviderOperationResult.Success();
+        }
+
+        var targetMigrationId = pendingMigrationIds.Max(StringComparer.Ordinal)!;
+        if (string.Equals(_migrationBackupAcknowledgement, targetMigrationId, StringComparison.Ordinal))
+        {
+            return DatabaseProviderOperationResult.Success();
+        }
+
+        return DatabaseProviderOperationResult.Failure(
+            $"PostgreSQL requires an administrator-managed backup before pending migrations. After creating and verifying that backup, "
+            + $"set CustomProviderOptions.Options[{PostgreSqlDatabaseProviderOptions.MigrationBackupAcknowledgement}] to '{targetMigrationId}' for this upgrade. "
+            + "Jellyfin cannot create or automatically restore this PostgreSQL backup.");
+    }
+
+    /// <inheritdoc/>
+    public DatabaseProviderStartupException? TranslateStartupException(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+
+        for (var current = exception; current is not null; current = current.InnerException)
+        {
+            if (current is PostgresException postgresException)
+            {
+                return postgresException.SqlState switch
+                {
+                    "28P01" or "28000" => CreateStartupException(
+                        DatabaseProviderStartupErrorCategory.Authentication,
+                        "PostgreSQL authentication failed. Verify the configured username, password, and host authentication rules."),
+                    "3F000" or "42501" => CreateStartupException(
+                        DatabaseProviderStartupErrorCategory.Permission,
+                        "The PostgreSQL user lacks a required database or schema permission. Grant CONNECT on the database and USAGE and CREATE on the target schema, then retry."),
+                    "42P01" or "42P07" or "42701" or "42710" or "42P16" => CreateStartupException(
+                        DatabaseProviderStartupErrorCategory.IncompatibleSchema,
+                        "The PostgreSQL database contains objects that conflict with Jellyfin's migration history. Use an empty database for a new server or a supported PostgreSQL migration history for an upgrade. Changing from SQLite is not a database migration."),
+                    _ => null
+                };
+            }
+
+            if (current is NpgsqlException or TimeoutException)
+            {
+                return CreateStartupException(
+                    DatabaseProviderStartupErrorCategory.Connectivity,
+                    "Jellyfin could not connect to PostgreSQL. Verify the configured host and port, network access, and that the PostgreSQL server is running.");
+            }
+        }
+
+        return null;
+    }
+
+    private static DatabaseProviderStartupException CreateStartupException(
+        DatabaseProviderStartupErrorCategory category,
+        string message)
+        => new(DatabaseProviderKey.PostgreSql, category, message);
+
+    /// <inheritdoc/>
     public Task<string> MigrationBackupFast(CancellationToken cancellationToken)
         => throw CreateFastBackupNotSupportedException();
 
@@ -394,14 +502,23 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         // explicit values are imported. PostgreSQL full-system restore therefore remains unsupported.
         var sql = $"TRUNCATE TABLE {string.Join(", ", quotedTables)} RESTART IDENTITY";
         var ownsTransaction = dbContext.Database.CurrentTransaction is null;
-        await using var transaction = ownsTransaction
+        var transaction = ownsTransaction
             ? await dbContext.Database.BeginTransactionAsync().ConfigureAwait(false)
             : null;
-
-        await dbContext.Database.ExecuteSqlRawAsync(sql).ConfigureAwait(false);
-        if (transaction is not null)
+        try
         {
-            await transaction.CommitAsync().ConfigureAwait(false);
+            await dbContext.Database.ExecuteSqlRawAsync(sql).ConfigureAwait(false);
+            if (transaction is not null)
+            {
+                await transaction.CommitAsync().ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            if (transaction is not null)
+            {
+                await transaction.DisposeAsync().ConfigureAwait(false);
+            }
         }
     }
 

@@ -93,6 +93,18 @@ internal class JellyfinMigrationService
 
     public async Task CheckFirstTimeRunOrMigration(IApplicationPaths appPaths, StartupOptions startupOptions)
     {
+        try
+        {
+            await CheckFirstTimeRunOrMigrationCore(appPaths, startupOptions).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (TryTranslateStartupException(ex, out var translatedException))
+        {
+            throw translatedException;
+        }
+    }
+
+    private async Task CheckFirstTimeRunOrMigrationCore(IApplicationPaths appPaths, StartupOptions startupOptions)
+    {
         var logger = _startupLogger.With(_loggerFactory.CreateLogger<JellyfinMigrationService>()).BeginGroup($"Migration Startup");
         logger.LogInformation("Initialise Migration service.");
         var xmlSerializer = new MyXmlSerializer();
@@ -121,13 +133,28 @@ internal class JellyfinMigrationService
 
                     await databaseCreator.CreateAsync().ConfigureAwait(false);
                 }
-                else if (string.Equals(_jellyfinDatabaseProvider?.ProviderKey, DatabaseProviderKey.PostgreSql, StringComparison.OrdinalIgnoreCase)
-                         && !await databaseCreator.HasTablesAsync().ConfigureAwait(false))
+                else if (string.Equals(_jellyfinDatabaseProvider?.ProviderKey, DatabaseProviderKey.PostgreSql, StringComparison.OrdinalIgnoreCase))
                 {
-                    // PostgreSQL databases are pre-created by an administrator. Remember that this particular
-                    // startup verified the database had no application tables before migration history was seeded;
-                    // this is the only state in which applying the initial baseline needs no pre-upgrade backup.
-                    _isFreshEmptyDatabaseInitialization = true;
+                    var isEmpty = _jellyfinDatabaseProvider is IDatabaseProviderMigrationPolicy migrationPolicy
+                        ? await migrationPolicy.IsDatabaseEmptyForInitialMigrationAsync(dbContext, CancellationToken.None).ConfigureAwait(false)
+                        : !await databaseCreator.HasTablesAsync().ConfigureAwait(false);
+                    if (isEmpty)
+                    {
+                        // PostgreSQL databases are pre-created by an administrator. Remember that this particular
+                        // startup verified the database had no application tables before migration history was seeded.
+                        _isFreshEmptyDatabaseInitialization = true;
+                    }
+                    else
+                    {
+                        var existingHistoryRepository = dbContext.GetService<IHistoryRepository>();
+                        if ((await existingHistoryRepository.GetAppliedMigrationsAsync().ConfigureAwait(false)).Count == 0)
+                        {
+                            throw new DatabaseProviderStartupException(
+                                DatabaseProviderKey.PostgreSql,
+                                DatabaseProviderStartupErrorCategory.IncompatibleSchema,
+                                "The PostgreSQL database is not empty and has no Jellyfin migration history. Use an empty database for a new server or a supported PostgreSQL migration history for an upgrade. Changing from SQLite is not a database migration.");
+                        }
+                    }
                 }
 
                 var historyRepository = dbContext.GetService<IHistoryRepository>();
@@ -265,6 +292,18 @@ internal class JellyfinMigrationService
     /// <returns>A value indicating whether at least one migration has been applied.</returns>
     public async Task<bool> MigrateStepAsync(JellyfinMigrationStageTypes stage, IServiceProvider serviceProvider)
     {
+        try
+        {
+            return await MigrateStepCoreAsync(stage, serviceProvider).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (TryTranslateStartupException(ex, out var translatedException))
+        {
+            throw translatedException;
+        }
+    }
+
+    private async Task<bool> MigrateStepCoreAsync(JellyfinMigrationStageTypes stage, IServiceProvider serviceProvider)
+    {
         var logger = _startupLogger.With(_loggerFactory.CreateLogger<JellyfinMigrationService>()).BeginGroup($"Migrate stage {stage}.");
         ICollection<CodeMigration> migrationStage = (Migrations.FirstOrDefault(e => e.Stage == stage) as ICollection<CodeMigration>) ?? [];
 
@@ -326,8 +365,9 @@ internal class JellyfinMigrationService
                 }
                 catch (Exception ex)
                 {
-                    migrationLogger.LogCritical("Error: {Error}", ex.Message);
-                    migrationLogger.LogError(ex, "Migration {Name} failed", item.Key);
+                    var reportedException = TranslateStartupException(ex) ?? ex;
+                    migrationLogger.LogCritical("Error: {Error}", reportedException.Message);
+                    migrationLogger.LogError(reportedException, "Migration {Name} failed", item.Key);
 
                     if (_backupKey != default && _backupService is not null && _jellyfinDatabaseProvider is not null)
                     {
@@ -366,6 +406,11 @@ internal class JellyfinMigrationService
                                 migrationLogger.LogCritical(inner, "Could not rollback from backup {Backup}. Manual intervention might be required to restore a operational state.", _backupKey.FullBackup.Path);
                             }
                         }
+                    }
+
+                    if (!ReferenceEquals(reportedException, ex))
+                    {
+                        throw reportedException;
                     }
 
                     throw;
@@ -481,9 +526,22 @@ internal class JellyfinMigrationService
 
     public async Task PrepareSystemForMigration(ILogger logger)
     {
+        try
+        {
+            await PrepareSystemForMigrationCore(logger).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (TryTranslateStartupException(ex, out var translatedException))
+        {
+            throw translatedException;
+        }
+    }
+
+    private async Task PrepareSystemForMigrationCore(ILogger logger)
+    {
         logger.LogInformation("Prepare system for possible migrations");
         JellyfinMigrationBackupAttribute backupInstruction;
         IReadOnlyList<HistoryRow> appliedMigrations;
+        string[] databaseMigrationsRequiringBackup;
         var dbContext = await _dbContextFactory.CreateDbContextAsync().ConfigureAwait(false);
         await using (dbContext.ConfigureAwait(false))
         {
@@ -492,21 +550,42 @@ internal class JellyfinMigrationService
             appliedMigrations = await historyRepository.GetAppliedMigrationsAsync().ConfigureAwait(false);
             var appliedMigrationIds = appliedMigrations.Select(migration => migration.MigrationId).ToHashSet(StringComparer.Ordinal);
             var providerMigrationIds = migrationsAssembly.Migrations.Keys.ToArray();
+            var pendingProviderMigrationIds = providerMigrationIds
+                .Where(migrationId => !appliedMigrationIds.Contains(migrationId))
+                .ToArray();
+            var canApplyInitialMigrationWithoutBackup = _isFreshEmptyDatabaseInitialization;
+            if (!canApplyInitialMigrationWithoutBackup
+                && pendingProviderMigrationIds.Length > 0
+                && providerMigrationIds.All(migrationId => !appliedMigrationIds.Contains(migrationId))
+                && _jellyfinDatabaseProvider is IDatabaseProviderMigrationPolicy migrationPolicy)
+            {
+                canApplyInitialMigrationWithoutBackup = await migrationPolicy
+                    .IsDatabaseEmptyForInitialMigrationAsync(dbContext, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+
             backupInstruction = new JellyfinMigrationBackupAttribute
             {
-                // Only a database verified as empty by this service immediately before setup may apply its
-                // provider baseline without a backup. Provider history alone cannot prove emptiness: a partial
-                // schema or code-migration-only history must retain the normal backup capability gate.
-                JellyfinDb = !_isFreshEmptyDatabaseInitialization
-                    && providerMigrationIds.Any(migrationId => !appliedMigrationIds.Contains(migrationId))
+                // The production host rebuilds its service provider between pre-start and core migrations. The
+                // provider catalog check safely carries the empty-database proof across that boundary while still
+                // rejecting partial or unrelated schemas.
+                JellyfinDb = !canApplyInitialMigrationWithoutBackup && pendingProviderMigrationIds.Length > 0
             };
+            databaseMigrationsRequiringBackup = pendingProviderMigrationIds;
         }
 
-        backupInstruction = Migrations.SelectMany(e => e)
+        var pendingCodeMigrations = Migrations.SelectMany(e => e)
            .Where(e => appliedMigrations.All(f => f.MigrationId != e.BuildCodeMigrationId()))
+           .ToArray();
+        backupInstruction = pendingCodeMigrations
            .Select(e => e.BackupRequirements)
            .Where(e => e is not null)
            .Aggregate(backupInstruction, MergeBackupAttributes!);
+        databaseMigrationsRequiringBackup = [
+            .. databaseMigrationsRequiringBackup,
+            .. pendingCodeMigrations
+                .Where(migration => migration.BackupRequirements?.JellyfinDb is true)
+                .Select(migration => migration.BuildCodeMigrationId())];
 
         if (backupInstruction.LegacyLibraryDb)
         {
@@ -546,30 +625,44 @@ internal class JellyfinMigrationService
 
         if (backupInstruction.JellyfinDb && _jellyfinDatabaseProvider is not null)
         {
+            var externalBackupAcknowledged = false;
             if (_jellyfinDatabaseProvider.Capabilities != DatabaseProviderCapabilities.Unknown
                 && !_jellyfinDatabaseProvider.Capabilities.HasFlag(DatabaseProviderCapabilities.FastMigrationBackup))
             {
-                throw new InvalidOperationException(
-                    $"Database provider '{_jellyfinDatabaseProvider.ProviderKey}' does not support the fast backup and restore operation required before pending migrations. "
-                    + "Startup has stopped before applying migrations. Back up the database using a provider-supported procedure before upgrading.");
+                var acknowledgement = _jellyfinDatabaseProvider is IDatabaseProviderMigrationPolicy migrationPolicy
+                    ? migrationPolicy.ValidateExternalMigrationBackupAcknowledgement(databaseMigrationsRequiringBackup)
+                    : DatabaseProviderOperationResult.Failure(
+                        $"Database provider '{_jellyfinDatabaseProvider.ProviderKey}' does not support the fast backup and restore operation required before pending migrations. "
+                        + "Startup has stopped before applying migrations. Back up the database using a provider-supported procedure before upgrading.");
+                if (!acknowledgement.Succeeded)
+                {
+                    throw new InvalidOperationException(acknowledgement.ErrorMessage);
+                }
+
+                externalBackupAcknowledged = true;
+                logger.LogWarning(
+                    "An administrator-managed database backup was acknowledged for pending migrations. Jellyfin cannot automatically restore that backup if a migration fails.");
             }
 
-            logger.LogInformation("A migration will attempt to modify the jellyfin.db, will attempt to backup the file now.");
-            string databaseBackupKey;
-            try
+            if (!externalBackupAcknowledged)
             {
-                databaseBackupKey = await _jellyfinDatabaseProvider.MigrationBackupFast(CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (NotImplementedException ex) when (_jellyfinDatabaseProvider.Capabilities == DatabaseProviderCapabilities.Unknown)
-            {
-                throw new InvalidOperationException(
-                    $"Legacy database provider '{_jellyfinDatabaseProvider.ProviderKey}' does not implement the fast backup operation required before pending migrations. "
-                    + "Startup has stopped before applying migrations. Back up the database using a provider-supported procedure before upgrading.",
-                    ex);
-            }
+                logger.LogInformation("A migration will attempt to modify the jellyfin.db, will attempt to backup the file now.");
+                string databaseBackupKey;
+                try
+                {
+                    databaseBackupKey = await _jellyfinDatabaseProvider.MigrationBackupFast(CancellationToken.None).ConfigureAwait(false);
+                }
+                catch (NotImplementedException ex) when (_jellyfinDatabaseProvider.Capabilities == DatabaseProviderCapabilities.Unknown)
+                {
+                    throw new InvalidOperationException(
+                        $"Legacy database provider '{_jellyfinDatabaseProvider.ProviderKey}' does not implement the fast backup operation required before pending migrations. "
+                        + "Startup has stopped before applying migrations. Back up the database using a provider-supported procedure before upgrading.",
+                        ex);
+                }
 
-            _backupKey = (_backupKey.LibraryDb, databaseBackupKey, _backupKey.FullBackup);
-            logger.LogInformation("Jellyfin database has been backed up as {BackupPath}", _backupKey.JellyfinDb);
+                _backupKey = (_backupKey.LibraryDb, databaseBackupKey, _backupKey.FullBackup);
+                logger.LogInformation("Jellyfin database has been backed up as {BackupPath}", _backupKey.JellyfinDb);
+            }
         }
 
         if (_backupService is not null && (backupInstruction.Metadata || backupInstruction.Subtitles || backupInstruction.Trickplay))
@@ -596,6 +689,31 @@ internal class JellyfinMigrationService
             Subtitles = left.Subtitles || right!.Subtitles,
             Trickplay = left.Trickplay || right!.Trickplay
         };
+    }
+
+    private DatabaseProviderStartupException? TranslateStartupException(Exception exception)
+    {
+        if (exception is DatabaseProviderStartupException)
+        {
+            return null;
+        }
+
+        return (_jellyfinDatabaseProvider as IDatabaseProviderMigrationPolicy)?.TranslateStartupException(exception);
+    }
+
+    private bool TryTranslateStartupException(
+        Exception exception,
+        out DatabaseProviderStartupException translatedException)
+    {
+        var translated = TranslateStartupException(exception);
+        if (translated is null)
+        {
+            translatedException = null!;
+            return false;
+        }
+
+        translatedException = translated;
+        return true;
     }
 
     private class InternalCodeMigration : IInternalMigration

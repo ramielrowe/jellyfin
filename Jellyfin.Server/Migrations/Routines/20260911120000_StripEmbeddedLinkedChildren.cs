@@ -33,7 +33,8 @@ internal class StripEmbeddedLinkedChildren : IAsyncMigrationRoutine
     /// <inheritdoc/>
     public async Task PerformAsync(CancellationToken cancellationToken)
     {
-        await using var context = await _dbProvider.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        var context = await _dbProvider.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using var contextScope = context.ConfigureAwait(false);
 
         // Data remains a text column on every provider. Parse it in the application so this historical
         // transform has identical semantics on SQLite and PostgreSQL, including preserving malformed blobs.

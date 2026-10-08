@@ -11,6 +11,12 @@ public static class PostgreSqlDatabaseProviderOptions
     public const string CommandTimeout = "command-timeout";
 
     /// <summary>
+    /// The custom provider option acknowledging that an administrator-managed PostgreSQL backup was completed
+    /// before applying migrations. Its value must equal the newest pending migration id.
+    /// </summary>
+    public const string MigrationBackupAcknowledgement = "migration-backup-acknowledgement";
+
+    /// <summary>
     /// The smallest accepted command timeout in seconds.
     /// </summary>
     public const int MinimumCommandTimeoutSeconds = 1;
