@@ -198,6 +198,15 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task<T> ExecuteScalarAsync<T>(string commandText, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = commandText;
+        return (T)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+    }
+
     public async Task<bool> TableExistsAsync(string tableName, CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
