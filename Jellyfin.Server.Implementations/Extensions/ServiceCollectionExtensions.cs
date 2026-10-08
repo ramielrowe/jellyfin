@@ -1,12 +1,12 @@
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Database.Implementations.Locking;
+using Jellyfin.Database.Providers.PostgreSql;
 using Jellyfin.Database.Providers.Sqlite;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Configuration;
@@ -24,6 +24,7 @@ public static class ServiceCollectionExtensions
 {
     private static IEnumerable<Type> DatabaseProviderTypes()
     {
+        yield return typeof(PostgreSqlDatabaseProvider);
         yield return typeof(SqliteDatabaseProvider);
     }
 
@@ -101,27 +102,6 @@ public static class ServiceCollectionExtensions
                     LockingBehavior = DatabaseLockingBehaviorTypes.NoLock
                 };
                 configurationManager.SaveConfiguration("database", efCoreConfiguration);
-            }
-        }
-
-        if (efCoreConfiguration.DatabaseType.Equals(DatabaseProviderKey.PostgreSql, StringComparison.OrdinalIgnoreCase)
-            && string.IsNullOrWhiteSpace(efCoreConfiguration.CustomProviderOptions?.ConnectionString))
-        {
-            throw new InvalidOperationException(
-                $"Database provider '{DatabaseProviderKey.PostgreSql}' requires a PostgreSQL connection string in database.xml at CustomProviderOptions.ConnectionString.");
-        }
-
-        if (efCoreConfiguration.DatabaseType.Equals(DatabaseProviderKey.PostgreSql, StringComparison.OrdinalIgnoreCase))
-        {
-            var commandTimeout = efCoreConfiguration.CustomProviderOptions?.Options.FirstOrDefault(
-                option => option.Key.Equals(PostgreSqlDatabaseProviderOptions.CommandTimeout, StringComparison.OrdinalIgnoreCase));
-            if (commandTimeout is not null
-                && (!int.TryParse(commandTimeout.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var commandTimeoutSeconds)
-                    || commandTimeoutSeconds < PostgreSqlDatabaseProviderOptions.MinimumCommandTimeoutSeconds))
-            {
-                throw new InvalidOperationException(
-                    $"Database provider '{DatabaseProviderKey.PostgreSql}' option 'CustomProviderOptions.Options[{PostgreSqlDatabaseProviderOptions.CommandTimeout}]' "
-                    + $"must be a positive whole number of seconds (minimum {PostgreSqlDatabaseProviderOptions.MinimumCommandTimeoutSeconds}).");
             }
         }
 
