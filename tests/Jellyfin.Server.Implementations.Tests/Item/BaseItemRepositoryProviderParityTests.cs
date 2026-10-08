@@ -3,6 +3,7 @@ using System.Linq;
 using Emby.Server.Implementations.Data;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Database.Implementations.Entities.Security;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Database.Providers.Sqlite.ValueConverters;
 using Jellyfin.Server.Implementations.Item;
@@ -102,6 +103,33 @@ public sealed class BaseItemRepositoryProviderParityTests : SqliteDbTestFixture
         Assert.IsType<DateTimeKindValueConverter>(dateCreated.GetValueConverter());
         Assert.Null(pathIndex.FindAnnotation("Npgsql:IndexMethod"));
         Assert.Null(entityType.FindProperty(nameof(BaseItemEntity.Type))!.GetMaxLength());
+    }
+
+    [Fact]
+    public void ArbitraryUniqueTextValues_RemainUnboundedAndRoundTripOnSqlite()
+    {
+        var longValue = "metadata-" + new string('x', 12_000);
+        var longPreferenceKey = "preference-" + new string('y', 12_000);
+        using var context = CreateDbContext();
+        var user = new User("long-values", "test-auth", "test-reset");
+        context.Users.Add(user);
+        context.ItemValues.Add(new ItemValue
+        {
+            ItemValueId = Guid.NewGuid(),
+            Type = ItemValueType.Genre,
+            Value = longValue,
+            CleanValue = longValue
+        });
+        context.CustomItemDisplayPreferences.Add(
+            new CustomItemDisplayPreferences(user.Id, Guid.NewGuid(), "test-client", longPreferenceKey, "value"));
+
+        context.SaveChanges();
+        context.ChangeTracker.Clear();
+
+        Assert.Null(context.Model.FindEntityType(typeof(ItemValue))!.FindProperty(nameof(ItemValue.Value))!.GetMaxLength());
+        Assert.Null(context.Model.FindEntityType(typeof(CustomItemDisplayPreferences))!.FindProperty(nameof(CustomItemDisplayPreferences.Key))!.GetMaxLength());
+        Assert.Equal(longValue, Assert.Single(context.ItemValues).Value);
+        Assert.Equal(longPreferenceKey, Assert.Single(context.CustomItemDisplayPreferences).Key);
     }
 
     private void Seed(params BaseItemEntity[] items)

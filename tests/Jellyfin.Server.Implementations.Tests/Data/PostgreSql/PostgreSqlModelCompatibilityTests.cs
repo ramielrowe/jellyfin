@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -9,6 +10,7 @@ using Jellyfin.Data.Enums;
 using Jellyfin.Data.Queries;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Database.Implementations.Entities.Security;
 using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Server.Implementations.Activity;
 using Jellyfin.Server.Implementations.Item;
@@ -20,6 +22,8 @@ using MediaBrowser.Controller.Persistence;
 using MediaBrowser.Model.Configuration;
 using MediaBrowser.Model.Entities;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Metadata;
 using Microsoft.Extensions.Logging.Abstractions;
 using Moq;
 using Xunit;
@@ -47,14 +51,15 @@ public sealed class PostgreSqlModelCompatibilityTests
         await using var context = database.CreateDbContext();
         Assert.True(await context.Database.EnsureCreatedAsync(cancellationToken).ConfigureAwait(true));
 
-        var relationalModel = context.Model.GetRelationalModel();
+        var model = context.GetService<IDesignTimeModel>().Model;
+        var relationalModel = model.GetRelationalModel();
         Assert.All(relationalModel.Tables, table => Assert.InRange(table.Name.Length, 1, 63));
         Assert.All(
             relationalModel.Tables.SelectMany(table => table.Indexes),
             index => Assert.InRange(index.Name.Length, 1, 63));
 
-        var baseItem = Assert.IsAssignableFrom<Microsoft.EntityFrameworkCore.Metadata.IReadOnlyEntityType>(
-            context.Model.FindEntityType(typeof(BaseItemEntity)));
+        var baseItem = Assert.IsAssignableFrom<IReadOnlyEntityType>(
+            model.FindEntityType(typeof(BaseItemEntity)));
         Assert.Contains(
             baseItem.GetIndexes(),
             index => index.GetFilter() == "\"PrimaryVersionId\" IS NOT NULL");
@@ -63,7 +68,7 @@ public sealed class PostgreSqlModelCompatibilityTests
             index => index.GetFilter() == "\"PrimaryVersionId\" IS NULL AND (\"OwnerId\" IS NULL OR \"ExtraType\" IS NOT NULL)");
 
         Assert.All(
-            context.Model.GetEntityTypes().SelectMany(entity => entity.GetIndexes()),
+            model.GetEntityTypes().SelectMany(entity => entity.GetIndexes()),
             index =>
             {
                 var indexedStrings = index.Properties.Where(property => property.ClrType == typeof(string)).ToArray();
@@ -73,6 +78,74 @@ public sealed class PostgreSqlModelCompatibilityTests
                     Assert.InRange(indexedStrings.Sum(property => property.GetMaxLength()!.Value), 1, 512);
                 }
             });
+
+        // Base-item query families: retain every safe composite and pair each deliberately split
+        // unbounded equality key with a hash index.
+        AssertIndex(baseItem, null, nameof(BaseItemEntity.TopParentId), nameof(BaseItemEntity.Id));
+        AssertIndex(baseItem, null, nameof(BaseItemEntity.Type), nameof(BaseItemEntity.TopParentId), nameof(BaseItemEntity.StartDate));
+        AssertIndex(baseItem, null, nameof(BaseItemEntity.Type), nameof(BaseItemEntity.TopParentId), nameof(BaseItemEntity.Id));
+        AssertIndex(baseItem, null, nameof(BaseItemEntity.TopParentId), nameof(BaseItemEntity.Type), nameof(BaseItemEntity.IsVirtualItem), nameof(BaseItemEntity.DateCreated));
+        AssertIndex(baseItem, null, nameof(BaseItemEntity.TopParentId), nameof(BaseItemEntity.IsFolder), nameof(BaseItemEntity.IsVirtualItem), nameof(BaseItemEntity.DateCreated));
+        AssertIndex(baseItem, null, nameof(BaseItemEntity.TopParentId), nameof(BaseItemEntity.MediaType), nameof(BaseItemEntity.IsVirtualItem), nameof(BaseItemEntity.DateCreated));
+        AssertIndex(baseItem, null, nameof(BaseItemEntity.Type), nameof(BaseItemEntity.TopParentId));
+        AssertIndex(baseItem, null, nameof(BaseItemEntity.Type), nameof(BaseItemEntity.IsFolder), nameof(BaseItemEntity.IsVirtualItem));
+        AssertIndex(baseItem, null, nameof(BaseItemEntity.MediaType), nameof(BaseItemEntity.TopParentId), nameof(BaseItemEntity.IsVirtualItem));
+        AssertIndex(baseItem, null, nameof(BaseItemEntity.Type), nameof(BaseItemEntity.ParentIndexNumber), nameof(BaseItemEntity.IndexNumber));
+        foreach (var propertyName in new[]
+                 {
+                     nameof(BaseItemEntity.Path),
+                     nameof(BaseItemEntity.Name),
+                     nameof(BaseItemEntity.CleanName),
+                     nameof(BaseItemEntity.PresentationUniqueKey),
+                     nameof(BaseItemEntity.SeriesPresentationUniqueKey),
+                     nameof(BaseItemEntity.SeriesName),
+                     nameof(BaseItemEntity.SortName)
+                 })
+        {
+            AssertIndex(baseItem, "hash", propertyName);
+        }
+
+        var people = AssertEntityType<People>(model);
+        AssertIndex(people, "hash", nameof(People.Name));
+        Assert.Equal("C", people.FindProperty(nameof(People.Name))!.GetCollation());
+
+        var streams = AssertEntityType<MediaStreamInfo>(model);
+        AssertIndex(streams, null, nameof(MediaStreamInfo.StreamType), nameof(MediaStreamInfo.ItemId), nameof(MediaStreamInfo.Language), nameof(MediaStreamInfo.IsExternal));
+        Assert.Equal(64, streams.FindProperty(nameof(MediaStreamInfo.Language))!.GetMaxLength());
+
+        var devices = AssertEntityType<Device>(model);
+        AssertIndex(devices, null, nameof(Device.DeviceId), nameof(Device.DateLastActivity));
+        AssertIndex(devices, null, nameof(Device.AccessToken), nameof(Device.DateLastActivity));
+        AssertIndex(devices, null, nameof(Device.UserId), nameof(Device.DeviceId));
+
+        var providers = AssertEntityType<BaseItemProvider>(model);
+        AssertIndex(providers, null, nameof(BaseItemProvider.ProviderId), nameof(BaseItemProvider.ItemId));
+        AssertIndex(providers, "hash", nameof(BaseItemProvider.ProviderValue));
+
+        var itemValues = AssertEntityType<ItemValue>(model);
+        AssertIndex(itemValues, null, nameof(ItemValue.Type));
+        AssertIndex(itemValues, "hash", nameof(ItemValue.CleanValue));
+        Assert.True(AssertIndex(itemValues, null, nameof(ItemValue.Type), "ValueDigest").IsUnique);
+        Assert.Null(itemValues.FindProperty(nameof(ItemValue.Value))!.GetMaxLength());
+
+        var customPreferences = AssertEntityType<CustomItemDisplayPreferences>(model);
+        Assert.True(AssertIndex(
+            customPreferences,
+            null,
+            nameof(CustomItemDisplayPreferences.UserId),
+            nameof(CustomItemDisplayPreferences.ItemId),
+            nameof(CustomItemDisplayPreferences.Client),
+            "KeyDigest").IsUnique);
+        Assert.Null(customPreferences.FindProperty(nameof(CustomItemDisplayPreferences.Key))!.GetMaxLength());
+
+        var activity = AssertEntityType<ActivityLog>(model);
+        Assert.Equal("C", activity.FindProperty(nameof(ActivityLog.Name))!.GetCollation());
+        Assert.Equal("C", activity.FindProperty(nameof(ActivityLog.Overview))!.GetCollation());
+        Assert.Equal("C", activity.FindProperty(nameof(ActivityLog.ShortOverview))!.GetCollation());
+        Assert.Equal("C", activity.FindProperty(nameof(ActivityLog.Type))!.GetCollation());
+        var users = AssertEntityType<User>(model);
+        Assert.Equal("C", users.FindProperty(nameof(User.Username))!.GetCollation());
+        Assert.Equal("C", users.FindProperty(nameof(User.NormalizedUsername))!.GetCollation());
     }
 
     [Fact]
@@ -147,6 +220,104 @@ public sealed class PostgreSqlModelCompatibilityTests
             await Assert.ThrowsAsync<DbUpdateException>(
                 () => context.SaveChangesAsync(TestContext.Current.CancellationToken)).ConfigureAwait(true);
         }
+    }
+
+    [Fact]
+    public async Task ArbitraryUniqueTextValues_AreNotTruncatedOrRejectedByPostgreSqlIndexes()
+    {
+        var context = await CreateSchemaAsync().ConfigureAwait(true);
+        var database = await _fixture.GetDatabaseAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        var userId = Guid.Empty;
+        var itemId = Guid.NewGuid();
+        var longValue = "metadata-" + new string('x', 12_000);
+        var longPreferenceKey = "preference-" + new string('y', 12_000);
+        await using (context.ConfigureAwait(true))
+        {
+            var user = new User("long-values", "test-auth", "test-reset");
+            userId = user.Id;
+            context.Users.Add(user);
+            context.ItemValues.Add(CreateItemValue(longValue));
+            context.CustomItemDisplayPreferences.Add(
+                new CustomItemDisplayPreferences(user.Id, itemId, "test-client", longPreferenceKey, "value"));
+
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+            context.ChangeTracker.Clear();
+
+            Assert.Equal(
+                longValue,
+                await context.ItemValues.Select(value => value.Value).SingleAsync(TestContext.Current.CancellationToken).ConfigureAwait(true));
+            Assert.Equal(
+                longPreferenceKey,
+                await context.CustomItemDisplayPreferences.Select(preference => preference.Key).SingleAsync(TestContext.Current.CancellationToken).ConfigureAwait(true));
+        }
+
+        await using (var duplicateItemValueContext = database.CreateDbContext())
+        {
+            duplicateItemValueContext.ItemValues.Add(CreateItemValue(longValue));
+            await Assert.ThrowsAsync<DbUpdateException>(
+                () => duplicateItemValueContext.SaveChangesAsync(TestContext.Current.CancellationToken)).ConfigureAwait(true);
+        }
+
+        await using var duplicatePreferenceContext = database.CreateDbContext();
+        duplicatePreferenceContext.CustomItemDisplayPreferences.Add(
+            new CustomItemDisplayPreferences(userId, itemId, "test-client", longPreferenceKey, "other"));
+        await Assert.ThrowsAsync<DbUpdateException>(
+            () => duplicatePreferenceContext.SaveChangesAsync(TestContext.Current.CancellationToken)).ConfigureAwait(true);
+    }
+
+    [Fact]
+    public async Task PostgreSqlPlanner_UsesRepresentativeProviderSpecificIndexes()
+    {
+        var context = await CreateSchemaAsync().ConfigureAwait(true);
+        await using (context.ConfigureAwait(true))
+        {
+            var cleanNamePlan = await ExplainAsync(
+                context,
+                "SELECT \"Id\" FROM \"BaseItems\" WHERE \"CleanName\" = 'needle'").ConfigureAwait(true);
+            var devicePlan = await ExplainAsync(
+                context,
+                "SELECT \"Id\" FROM \"Devices\" WHERE \"DeviceId\" = 'device' ORDER BY \"DateLastActivity\" DESC").ConfigureAwait(true);
+            var streamPlan = await ExplainAsync(
+                context,
+                "SELECT \"ItemId\" FROM \"MediaStreamInfos\" WHERE \"StreamType\" = 0 AND \"Language\" = 'eng' AND NOT \"IsExternal\"").ConfigureAwait(true);
+
+            Assert.Contains("IX_BaseItems_CleanName", cleanNamePlan, StringComparison.Ordinal);
+            Assert.Contains("IX_Devices_DeviceId_DateLastActivity", devicePlan, StringComparison.Ordinal);
+            Assert.Contains("IX_MediaStreamInfos_StreamType_ItemId_Language_IsExternal", streamPlan, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public async Task ActivityAndUsernameCaseRules_UseColumnCollationInsteadOfDatabaseLocale()
+    {
+        var context = await CreateSchemaAsync().ConfigureAwait(true);
+        await using (context.ConfigureAwait(true))
+        {
+            var collations = await GetTextColumnCollationsAsync(context).ConfigureAwait(true);
+            Assert.Equal("C", collations[("ActivityLogs", "Name")]);
+            Assert.Equal("C", collations[("ActivityLogs", "Overview")]);
+            Assert.Equal("C", collations[("ActivityLogs", "ShortOverview")]);
+            Assert.Equal("C", collations[("ActivityLogs", "Type")]);
+            Assert.Equal("C", collations[("Users", "Username")]);
+            Assert.Equal("C", collations[("Users", "NormalizedUsername")]);
+
+            var caseFolds = await GetTurkishAndOrdinalCaseFoldsAsync(context).ConfigureAwait(true);
+            Assert.NotEqual(caseFolds.Turkish, caseFolds.Ordinal);
+            Assert.Equal("i", caseFolds.Ordinal);
+
+            context.ActivityLogs.Add(new ActivityLog("INDEX FINISHED", "LIBRARY", Guid.Empty));
+            context.Users.Add(new User("CaseUser", "test-auth", "test-reset"));
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        var database = await _fixture.GetDatabaseAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        var manager = new ActivityManager(CreateDbContextFactory(database));
+        Assert.Single((await manager.GetPagedResultAsync(new ActivityLogQuery { Name = "index" }).ConfigureAwait(true)).Items);
+
+        await using var duplicateContext = database.CreateDbContext();
+        duplicateContext.Users.Add(new User("caseuser", "test-auth", "test-reset"));
+        await Assert.ThrowsAsync<DbUpdateException>(
+            () => duplicateContext.SaveChangesAsync(TestContext.Current.CancellationToken)).ConfigureAwait(true);
     }
 
     [Fact]
@@ -423,6 +594,85 @@ public sealed class PostgreSqlModelCompatibilityTests
         var context = database.CreateDbContext();
         await context.Database.EnsureCreatedAsync(cancellationToken).ConfigureAwait(true);
         return context;
+    }
+
+    private static IReadOnlyEntityType AssertEntityType<TEntity>(IReadOnlyModel model)
+        => Assert.IsAssignableFrom<IReadOnlyEntityType>(model.FindEntityType(typeof(TEntity)));
+
+    private static IReadOnlyIndex AssertIndex(IReadOnlyEntityType entityType, string? method, params string[] propertyNames)
+    {
+        var index = Assert.Single(
+            entityType.GetIndexes(),
+            candidate => candidate.Properties.Select(property => property.Name).SequenceEqual(propertyNames));
+        Assert.Equal(method, index.GetMethod());
+        return index;
+    }
+
+    private static async Task<string> ExplainAsync(JellyfinDbContext context, string sql)
+    {
+        var connection = context.Database.GetDbConnection();
+        if (connection.State != ConnectionState.Open)
+        {
+            await connection.OpenAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        await using (var disableSequentialScans = connection.CreateCommand())
+        {
+            disableSequentialScans.CommandText = "SET enable_seqscan = off";
+            await disableSequentialScans.ExecuteNonQueryAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = "EXPLAIN (COSTS OFF) " + sql;
+        await using var reader = await command.ExecuteReaderAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        var lines = new List<string>();
+        while (await reader.ReadAsync(TestContext.Current.CancellationToken).ConfigureAwait(true))
+        {
+            lines.Add(reader.GetString(0));
+        }
+
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private static async Task<Dictionary<(string Table, string Column), string>> GetTextColumnCollationsAsync(JellyfinDbContext context)
+    {
+        var connection = context.Database.GetDbConnection();
+        if (connection.State != ConnectionState.Open)
+        {
+            await connection.OpenAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT c.relname, a.attname, coll.collname "
+            + "FROM pg_attribute a "
+            + "JOIN pg_class c ON c.oid = a.attrelid "
+            + "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            + "JOIN pg_collation coll ON coll.oid = a.attcollation "
+            + "WHERE n.nspname = 'public' AND c.relname IN ('ActivityLogs', 'Users')";
+        await using var reader = await command.ExecuteReaderAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        var result = new Dictionary<(string Table, string Column), string>();
+        while (await reader.ReadAsync(TestContext.Current.CancellationToken).ConfigureAwait(true))
+        {
+            result[(reader.GetString(0), reader.GetString(1))] = reader.GetString(2);
+        }
+
+        return result;
+    }
+
+    private static async Task<(string Turkish, string Ordinal)> GetTurkishAndOrdinalCaseFoldsAsync(JellyfinDbContext context)
+    {
+        var connection = context.Database.GetDbConnection();
+        if (connection.State != ConnectionState.Open)
+        {
+            await connection.OpenAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT lower('I' COLLATE \"tr-x-icu\"), lower('I' COLLATE \"C\")";
+        await using var reader = await command.ExecuteReaderAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        Assert.True(await reader.ReadAsync(TestContext.Current.CancellationToken).ConfigureAwait(true));
+        return (reader.GetString(0), reader.GetString(1));
     }
 
     private static ItemValue CreateItemValue(string value)
