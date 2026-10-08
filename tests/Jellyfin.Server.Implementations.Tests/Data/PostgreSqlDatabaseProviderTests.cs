@@ -1,6 +1,8 @@
 using System;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Database.Providers.PostgreSql;
@@ -17,6 +19,74 @@ namespace Jellyfin.Server.Implementations.Tests.Data;
 public class PostgreSqlDatabaseProviderTests
 {
     private const string ConnectionString = "Host=database.internal;Port=5544;Database=jellyfin;Username=jellyfin;Password=secret";
+
+    [Fact]
+    public void Capabilities_DoNotAdvertiseUnrestorableBackupPaths()
+    {
+        var provider = new PostgreSqlDatabaseProvider(Mock.Of<ILogger<PostgreSqlDatabaseProvider>>());
+
+        Assert.Equal(DatabaseProviderCapabilities.None, provider.Capabilities);
+    }
+
+    [Fact]
+    public async Task FastMigrationBackupOperations_AreRejectedWithActionableGuidance()
+    {
+        var provider = new PostgreSqlDatabaseProvider(Mock.Of<ILogger<PostgreSqlDatabaseProvider>>());
+
+        var createException = await Assert.ThrowsAsync<NotSupportedException>(
+            () => provider.MigrationBackupFast(TestContext.Current.CancellationToken));
+        var restoreResult = await provider.TryRestoreBackupFast("unused", TestContext.Current.CancellationToken);
+        var deleteResult = await provider.TryDeleteBackup("unused");
+
+        Assert.Contains("external server-side backup tooling", createException.Message, StringComparison.Ordinal);
+        Assert.Contains("before upgrading", createException.Message, StringComparison.Ordinal);
+        Assert.False(restoreResult.Succeeded);
+        Assert.Contains("before upgrading", restoreResult.ErrorMessage, StringComparison.Ordinal);
+        Assert.False(deleteResult.Succeeded);
+        Assert.Contains("before upgrading", deleteResult.ErrorMessage, StringComparison.Ordinal);
+        Assert.DoesNotContain("secret", createException.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Maintenance_WithCancelledToken_DoesNotCreateContext()
+    {
+        var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
+        var provider = new PostgreSqlDatabaseProvider(Mock.Of<ILogger<PostgreSqlDatabaseProvider>>())
+        {
+            DbContextFactory = factory.Object
+        };
+        using var cancellationTokenSource = new CancellationTokenSource();
+        await cancellationTokenSource.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => provider.RefreshStatistics(cancellationTokenSource.Token));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => provider.RunScheduledOptimisation(cancellationTokenSource.Token));
+
+        factory.Verify(
+            item => item.CreateDbContextAsync(It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task ShutdownTask_IsBoundedAndHonorsCancellation()
+    {
+        var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
+        var provider = new PostgreSqlDatabaseProvider(Mock.Of<ILogger<PostgreSqlDatabaseProvider>>())
+        {
+            DbContextFactory = factory.Object
+        };
+
+        await provider.RunShutdownTask(CancellationToken.None);
+        using var cancellationTokenSource = new CancellationTokenSource();
+        await cancellationTokenSource.CancelAsync();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => provider.RunShutdownTask(cancellationTokenSource.Token));
+
+        factory.Verify(
+            item => item.CreateDbContextAsync(It.IsAny<CancellationToken>()),
+            Times.Never);
+    }
 
     [Fact]
     public void Initialise_ConfiguresNpgsqlMigrationsAssemblyAndDefaultCommandTimeout()

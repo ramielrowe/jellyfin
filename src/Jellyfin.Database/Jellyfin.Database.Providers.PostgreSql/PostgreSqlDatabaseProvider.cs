@@ -302,38 +302,131 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     }
 
     /// <inheritdoc/>
-    public Task RunScheduledOptimisation(CancellationToken cancellationToken)
+    public async Task RunScheduledOptimisation(CancellationToken cancellationToken)
     {
-        _logger.LogDebug("PostgreSQL scheduled maintenance is not implemented yet");
-        return Task.CompletedTask;
+        _logger.LogDebug("Running PostgreSQL vacuum and statistics maintenance");
+        await ExecuteMaintenanceCommandAsync("VACUUM (ANALYZE)", cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
-    public Task RefreshStatistics(CancellationToken cancellationToken)
+    public async Task RefreshStatistics(CancellationToken cancellationToken)
     {
-        _logger.LogDebug("PostgreSQL statistics refresh is not implemented yet");
-        return Task.CompletedTask;
+        _logger.LogDebug("Refreshing PostgreSQL query planner statistics");
+        await ExecuteMaintenanceCommandAsync("ANALYZE", cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc/>
     public Task RunShutdownTask(CancellationToken cancellationToken)
     {
-        return Task.CompletedTask;
+        // PostgreSQL performs durability and connection cleanup on the server. Do not put VACUUM,
+        // checkpoints, or any other database-size-dependent work on Jellyfin's shutdown path.
+        return cancellationToken.IsCancellationRequested
+            ? Task.FromCanceled(cancellationToken)
+            : Task.CompletedTask;
     }
 
     /// <inheritdoc/>
     public Task<string> MigrationBackupFast(CancellationToken cancellationToken)
-        => throw new NotSupportedException("The PostgreSQL provider does not support fast migration backups yet.");
+        => throw CreateFastBackupNotSupportedException();
 
     /// <inheritdoc/>
     public Task RestoreBackupFast(string key, CancellationToken cancellationToken)
-        => throw new NotSupportedException("The PostgreSQL provider does not support fast migration backup restores yet.");
+        => throw CreateFastBackupNotSupportedException();
+
+    /// <inheritdoc/>
+    public Task<DatabaseProviderOperationResult> TryRestoreBackupFast(string key, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(DatabaseProviderOperationResult.Failure(GetFastBackupUnsupportedMessage()));
+    }
 
     /// <inheritdoc/>
     public Task DeleteBackup(string key)
-        => throw new NotSupportedException("The PostgreSQL provider does not support fast migration backup deletion yet.");
+        => throw CreateFastBackupNotSupportedException();
 
     /// <inheritdoc/>
-    public Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames)
-        => throw new NotSupportedException("The PostgreSQL provider does not support database purges yet.");
+    public Task<DatabaseProviderOperationResult> TryDeleteBackup(string key)
+        => Task.FromResult(DatabaseProviderOperationResult.Failure(GetFastBackupUnsupportedMessage()));
+
+    /// <inheritdoc/>
+    public async Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames)
+    {
+        ArgumentNullException.ThrowIfNull(dbContext);
+
+        var modelTables = dbContext.Model.GetEntityTypes()
+            .Select(entityType => new
+            {
+                SchemaQualifiedName = entityType.GetSchemaQualifiedTableName(),
+                Schema = entityType.GetSchema(),
+                Table = entityType.GetTableName()
+            })
+            .Where(table => table.SchemaQualifiedName is not null && table.Table is not null)
+            .GroupBy(table => table.SchemaQualifiedName!, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.First(), StringComparer.Ordinal);
+
+        var requestedNames = tableNames?.Distinct(StringComparer.Ordinal).ToArray()
+            ?? modelTables.Keys.ToArray();
+        if (requestedNames.Length == 0)
+        {
+            return;
+        }
+
+        var quotedTables = new List<string>(requestedNames.Length);
+        foreach (var requestedName in requestedNames)
+        {
+            if (!modelTables.TryGetValue(requestedName, out var table))
+            {
+                throw new InvalidOperationException(
+                    $"Refusing to purge PostgreSQL table '{requestedName}' because it is not mapped by the Jellyfin database model.");
+            }
+
+            quotedTables.Add(QuoteTableName(table.Schema, table.Table!));
+        }
+
+        // A single TRUNCATE statement lets PostgreSQL validate all foreign-key relationships before
+        // changing any data. Deliberately omit CASCADE so an unexpected table outside the supplied
+        // Jellyfin model can never be modified. RESTART IDENTITY resets only sequences owned by the
+        // tables being purged and makes subsequent generated keys safe for an empty logical restore.
+        var sql = $"TRUNCATE TABLE {string.Join(", ", quotedTables)} RESTART IDENTITY";
+        var ownsTransaction = dbContext.Database.CurrentTransaction is null;
+        await using var transaction = ownsTransaction
+            ? await dbContext.Database.BeginTransactionAsync().ConfigureAwait(false)
+            : null;
+
+        await dbContext.Database.ExecuteSqlRawAsync(sql).ConfigureAwait(false);
+        if (transaction is not null)
+        {
+            await transaction.CommitAsync().ConfigureAwait(false);
+        }
+    }
+
+    private async Task ExecuteMaintenanceCommandAsync(string command, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var factory = DbContextFactory
+            ?? throw new InvalidOperationException("The PostgreSQL database provider has not been initialized.");
+        var context = await factory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
+        await using (context.ConfigureAwait(false))
+        {
+            // The configured PostgreSQL command timeout bounds this server-side operation. VACUUM
+            // intentionally runs outside a transaction, as PostgreSQL requires.
+            await context.Database.ExecuteSqlRawAsync(command, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static string QuoteTableName(string? schema, string table)
+        // Npgsql's default schema is public. Always qualify it explicitly so a customized search_path
+        // cannot redirect a destructive maintenance operation to an identically named table.
+        => $"{QuoteIdentifier(string.IsNullOrEmpty(schema) ? "public" : schema)}.{QuoteIdentifier(table)}";
+
+    private static string QuoteIdentifier(string identifier)
+        => $"\"{identifier.Replace("\"", "\"\"", StringComparison.Ordinal)}\"";
+
+    private static NotSupportedException CreateFastBackupNotSupportedException()
+        => new(GetFastBackupUnsupportedMessage());
+
+    private static string GetFastBackupUnsupportedMessage()
+        => "The PostgreSQL provider cannot create or restore Jellyfin fast migration backups without external server-side backup tooling. "
+            + "Back up the PostgreSQL database using your administrator's supported procedure before upgrading; "
+            + "Jellyfin will stop before applying a migration that requires an automatic rollback backup.";
 }
