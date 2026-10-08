@@ -161,6 +161,11 @@ This repository also includes unit tests that are used to validate functionality
 
 The following sections describe some more advanced scenarios for running the server from source that build upon the standard instructions above.
 
+Experimental PostgreSQL support is available only for fresh PostgreSQL installations and PostgreSQL-to-PostgreSQL
+upgrades. It does not migrate an existing SQLite library, and switching `DatabaseType` is not a migration. Read the
+[PostgreSQL database provider guide](docs/postgresql.md), including its backup and restore limitations, before enabling
+it. SQLite remains the default database provider.
+
 #### Hosting The Web Client Separately
 
 It is not necessary to host the frontend web client as part of the backend server. Hosting these two components separately may be useful for frontend developers who would prefer to host the client in a separate webpack development server for a tighter development loop. See the [jellyfin-web](https://github.com/jellyfin/jellyfin-web#getting-started) repo for instructions on how to do this.
