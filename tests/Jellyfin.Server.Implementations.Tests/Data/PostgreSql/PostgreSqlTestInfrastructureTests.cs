@@ -54,6 +54,19 @@ public sealed class PostgreSqlTestInfrastructureTests
     }
 
     [Fact]
+    public void ValidateRuntimeConnectionString_MalformedValueDoesNotExposeCredential()
+    {
+        const string Password = "do-not-expose-this";
+
+        var exception = Assert.Throws<InvalidOperationException>(
+            () => PostgreSqlTestDatabase.ValidateRuntimeConnectionString(
+                $"Host=localhost;Database=jellyfin_test_admin;Password={Password};Unknown Keyword=value"));
+
+        Assert.DoesNotContain(Password, exception.ToString(), StringComparison.Ordinal);
+        Assert.Contains(PostgreSqlDatabaseFixture.RuntimeConnectionStringEnvironmentVariable, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void RedactConnectionString_RemovesAllCredentialKeysAndValues()
     {
         const string Password = "do-not-expose-this";

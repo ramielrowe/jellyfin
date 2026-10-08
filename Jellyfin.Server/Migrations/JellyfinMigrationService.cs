@@ -35,6 +35,7 @@ internal class JellyfinMigrationService
     private readonly IJellyfinDatabaseProvider? _jellyfinDatabaseProvider;
     private readonly IApplicationPaths _applicationPaths;
     private (string? LibraryDb, string? JellyfinDb, BackupManifestDto? FullBackup) _backupKey;
+    private bool _isFreshEmptyDatabaseInitialization;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="JellyfinMigrationService"/> class.
@@ -98,6 +99,7 @@ internal class JellyfinMigrationService
         var serverConfig = File.Exists(appPaths.SystemConfigurationFilePath)
             ? (ServerConfiguration)xmlSerializer.DeserializeFromFile(typeof(ServerConfiguration), appPaths.SystemConfigurationFilePath)!
             : new ServerConfiguration();
+        _isFreshEmptyDatabaseInitialization = false;
         if (!serverConfig.IsStartupWizardCompleted || startupOptions.StartupMode is Configuration.StartupMode.SeedSystem)
         {
             logger.LogInformation("System initialization detected. Seed data. Startup mode is: {StartupMode}", startupOptions.StartupMode ?? Configuration.StartupMode.MediaServer);
@@ -119,13 +121,22 @@ internal class JellyfinMigrationService
 
                     await databaseCreator.CreateAsync().ConfigureAwait(false);
                 }
+                else if (string.Equals(_jellyfinDatabaseProvider?.ProviderKey, DatabaseProviderKey.PostgreSql, StringComparison.OrdinalIgnoreCase)
+                         && !await databaseCreator.HasTablesAsync().ConfigureAwait(false))
+                {
+                    // PostgreSQL databases are pre-created by an administrator. Remember that this particular
+                    // startup verified the database had no application tables before migration history was seeded;
+                    // this is the only state in which applying the initial baseline needs no pre-upgrade backup.
+                    _isFreshEmptyDatabaseInitialization = true;
+                }
 
                 var historyRepository = dbContext.GetService<IHistoryRepository>();
 
                 await historyRepository.CreateIfNotExistsAsync().ConfigureAwait(false);
-                var appliedMigrations = await dbContext.Database.GetAppliedMigrationsAsync().ConfigureAwait(false);
+                var appliedMigrationIds = (await dbContext.Database.GetAppliedMigrationsAsync().ConfigureAwait(false))
+                    .ToHashSet(StringComparer.Ordinal);
                 var startupScripts = flatApplyMigrations
-                    .Where(e => !appliedMigrations.Any(f => f != e.BuildCodeMigrationId()))
+                    .Where(e => !appliedMigrationIds.Contains(e.BuildCodeMigrationId()))
                     .Select(e => (Migration: e.Metadata, Script: historyRepository.GetInsertScript(new HistoryRow(e.BuildCodeMigrationId(), GetJellyfinVersion()))))
                     .ToArray();
                 foreach (var item in startupScripts)
@@ -481,12 +492,12 @@ internal class JellyfinMigrationService
             appliedMigrations = await historyRepository.GetAppliedMigrationsAsync().ConfigureAwait(false);
             var appliedMigrationIds = appliedMigrations.Select(migration => migration.MigrationId).ToHashSet(StringComparer.Ordinal);
             var providerMigrationIds = migrationsAssembly.Migrations.Keys.ToArray();
-            backupInstruction = new JellyfinMigrationBackupAttribute()
+            backupInstruction = new JellyfinMigrationBackupAttribute
             {
-                // A first run applies the provider's baseline to an empty, pre-created database. There is no
-                // existing database state to protect and PostgreSQL deliberately runs without backup/admin
-                // privileges. Once any provider migration has been applied, retain the normal pre-upgrade backup.
-                JellyfinDb = providerMigrationIds.Any(appliedMigrationIds.Contains)
+                // Only a database verified as empty by this service immediately before setup may apply its
+                // provider baseline without a backup. Provider history alone cannot prove emptiness: a partial
+                // schema or code-migration-only history must retain the normal backup capability gate.
+                JellyfinDb = !_isFreshEmptyDatabaseInitialization
                     && providerMigrationIds.Any(migrationId => !appliedMigrationIds.Contains(migrationId))
             };
         }

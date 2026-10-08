@@ -40,12 +40,25 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
 
     public static async Task<PostgreSqlTestDatabase> CreateAsync(
         string administratorConnectionString,
+        string runtimeConnectionString,
         CancellationToken cancellationToken,
         Action<string>? databaseCreated = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
         var administratorBuilder = ValidateAdministratorConnectionString(administratorConnectionString);
+        var runtimeBuilder = ValidateRuntimeConnectionString(runtimeConnectionString);
+        if (string.Equals(administratorBuilder.Username, runtimeBuilder.Username, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("The PostgreSQL integration-test harness and runtime roles must be different roles.");
+        }
+
+        if (!string.Equals(administratorBuilder.Host, runtimeBuilder.Host, StringComparison.OrdinalIgnoreCase)
+            || administratorBuilder.Port != runtimeBuilder.Port)
+        {
+            throw new InvalidOperationException("The PostgreSQL integration-test harness and runtime connection strings must target the same server.");
+        }
+
         administratorBuilder.Pooling = false;
         administratorBuilder.IncludeErrorDetail = false;
         var normalizedAdministratorConnectionString = administratorBuilder.ConnectionString;
@@ -64,18 +77,33 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
                 if (await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not true)
                 {
                     throw new InvalidOperationException(
-                        "The PostgreSQL integration-test role must be NOSUPERUSER, NOCREATEROLE, and CREATEDB; see Data/PostgreSql/README.md.");
+                        "The PostgreSQL integration-test harness role must be NOSUPERUSER, NOCREATEROLE, and CREATEDB; see Data/PostgreSql/README.md.");
                 }
 
-                command.CommandText = "CREATE DATABASE " + QuoteOwnedDatabaseName(databaseName);
+                command.CommandText = "CREATE DATABASE " + QuoteOwnedDatabaseName(databaseName)
+                    + " OWNER " + QuoteIdentifier(runtimeBuilder.Username!);
                 createDatabaseAttempted = true;
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            runtimeBuilder.Pooling = false;
+            runtimeBuilder.IncludeErrorDetail = false;
+            await using (var runtimeDataSource = NpgsqlDataSource.Create(runtimeBuilder.ConnectionString))
+            await using (var runtimeConnection = await runtimeDataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false))
+            await using (var command = runtimeConnection.CreateCommand())
+            {
+                command.CommandText = "SELECT NOT rolsuper AND NOT rolcreaterole AND NOT rolcreatedb FROM pg_roles WHERE rolname = current_user";
+                if (await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not true)
+                {
+                    throw new InvalidOperationException(
+                        "The PostgreSQL integration-test runtime role must be NOSUPERUSER, NOCREATEROLE, and NOCREATEDB; see Data/PostgreSql/README.md.");
+                }
             }
 
             databaseCreated?.Invoke(databaseName);
             cancellationToken.ThrowIfCancellationRequested();
 
-            var testBuilder = new NpgsqlConnectionStringBuilder(normalizedAdministratorConnectionString)
+            var testBuilder = new NpgsqlConnectionStringBuilder(runtimeBuilder.ConnectionString)
             {
                 Database = databaseName,
                 ApplicationName = "Jellyfin PostgreSQL integration tests",
@@ -124,7 +152,7 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
 
             throw new InvalidOperationException(
                 "Unable to create an isolated PostgreSQL test database. Verify that the configured server is reachable "
-                + "and that the test role has CREATEDB permission.");
+                + "and that the test harness role has CREATEDB permission and membership in the runtime role.");
         }
         catch (Exception)
         {
@@ -152,7 +180,7 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
     public JellyfinDbContext CreateDbContextForDatabase(string databaseName)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        var connectionStringBuilder = new NpgsqlConnectionStringBuilder(_administratorConnectionString)
+        var connectionStringBuilder = new NpgsqlConnectionStringBuilder(_connectionString)
         {
             Database = databaseName,
             Pooling = false
@@ -306,6 +334,31 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         return builder;
     }
 
+    public static NpgsqlConnectionStringBuilder ValidateRuntimeConnectionString(string connectionString)
+    {
+        NpgsqlConnectionStringBuilder builder;
+        try
+        {
+            builder = new NpgsqlConnectionStringBuilder(connectionString);
+        }
+        catch (ArgumentException)
+        {
+            throw new InvalidOperationException(
+                "The PostgreSQL integration-test runtime connection string is invalid. Check "
+                + PostgreSqlDatabaseFixture.RuntimeConnectionStringEnvironmentVariable + ".");
+        }
+
+        if (string.IsNullOrWhiteSpace(builder.Host)
+            || string.IsNullOrWhiteSpace(builder.Database)
+            || string.IsNullOrWhiteSpace(builder.Username))
+        {
+            throw new InvalidOperationException(
+                "The PostgreSQL integration-test runtime connection string must specify Host, Database, and Username.");
+        }
+
+        return builder;
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
@@ -354,6 +407,9 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
 
         return '"' + databaseName + '"';
     }
+
+    private static string QuoteIdentifier(string identifier)
+        => '"' + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + '"';
 
     private static async Task DropOwnedDatabaseAsync(
         NpgsqlDataSource administratorDataSource,

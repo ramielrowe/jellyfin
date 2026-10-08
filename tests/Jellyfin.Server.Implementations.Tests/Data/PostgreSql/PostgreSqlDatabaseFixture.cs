@@ -8,10 +8,12 @@ namespace Jellyfin.Server.Implementations.Tests.Data.PostgreSql;
 public sealed class PostgreSqlDatabaseFixture : IAsyncLifetime
 {
     public const string ConnectionStringEnvironmentVariable = "JELLYFIN_POSTGRES_TEST_CONNECTION_STRING";
+    public const string RuntimeConnectionStringEnvironmentVariable = "JELLYFIN_POSTGRES_TEST_RUNTIME_CONNECTION_STRING";
     public const string RequiredEnvironmentVariable = "JELLYFIN_POSTGRES_TEST_REQUIRED";
 
     private readonly SemaphoreSlim _initializationLock = new(1, 1);
     private readonly string? _administratorConnectionString = Environment.GetEnvironmentVariable(ConnectionStringEnvironmentVariable);
+    private readonly string? _runtimeConnectionString = Environment.GetEnvironmentVariable(RuntimeConnectionStringEnvironmentVariable);
     private readonly bool _isRequired = string.Equals(
         Environment.GetEnvironmentVariable(RequiredEnvironmentVariable),
         "true",
@@ -19,9 +21,10 @@ public sealed class PostgreSqlDatabaseFixture : IAsyncLifetime
 
     private PostgreSqlTestDatabase? _database;
 
-    public bool IsConfigured => !string.IsNullOrWhiteSpace(_administratorConnectionString);
+    public bool IsConfigured => !string.IsNullOrWhiteSpace(_administratorConnectionString)
+        && !string.IsNullOrWhiteSpace(_runtimeConnectionString);
 
-    public string SkipReason => $"Set {ConnectionStringEnvironmentVariable} to run tests against a real PostgreSQL server; see Data/PostgreSql/README.md.";
+    public string SkipReason => $"Set {ConnectionStringEnvironmentVariable} and {RuntimeConnectionStringEnvironmentVariable} to run tests against a real PostgreSQL server; see Data/PostgreSql/README.md.";
 
     public ValueTask InitializeAsync()
     {
@@ -51,6 +54,7 @@ public sealed class PostgreSqlDatabaseFixture : IAsyncLifetime
         {
             _database ??= await PostgreSqlTestDatabase.CreateAsync(
                 _administratorConnectionString!,
+                _runtimeConnectionString!,
                 cancellationToken).ConfigureAwait(false);
             return _database;
         }
@@ -82,7 +86,11 @@ public sealed class PostgreSqlDatabaseFixture : IAsyncLifetime
             throw new InvalidOperationException(SkipReason);
         }
 
-        return PostgreSqlTestDatabase.CreateAsync(_administratorConnectionString!, cancellationToken, databaseCreated);
+        return PostgreSqlTestDatabase.CreateAsync(
+            _administratorConnectionString!,
+            _runtimeConnectionString!,
+            cancellationToken,
+            databaseCreated);
     }
 
     public async ValueTask DisposeAsync()

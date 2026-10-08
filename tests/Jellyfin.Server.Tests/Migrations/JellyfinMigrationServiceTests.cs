@@ -139,23 +139,51 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
     [Fact]
     public async Task PrepareSystemForMigration_WhenFastBackupIsUnsupported_StopsBeforeBackup()
     {
-        var sqliteProvider = new SqliteDatabaseProvider(_paths, NullLogger<SqliteDatabaseProvider>.Instance);
-        var provider = new Mock<IJellyfinDatabaseProvider>();
-        provider.SetupGet(p => p.ProviderKey).Returns(DatabaseProviderKey.PostgreSql);
-        provider.SetupGet(p => p.Capabilities).Returns(DatabaseProviderCapabilities.None);
-        provider
-            .Setup(p => p.Initialise(It.IsAny<DbContextOptionsBuilder>(), It.IsAny<DatabaseConfigurationOptions>()))
-            .Callback<DbContextOptionsBuilder, DatabaseConfigurationOptions>(sqliteProvider.Initialise);
-        provider.Setup(p => p.OnModelCreating(It.IsAny<ModelBuilder>())).Callback<ModelBuilder>(sqliteProvider.OnModelCreating);
-        provider
-            .Setup(p => p.ConfigureConventions(It.IsAny<ModelConfigurationBuilder>()))
-            .Callback<ModelConfigurationBuilder>(sqliteProvider.ConfigureConventions);
+        var provider = CreatePostgreSqlProviderMock(DatabaseProviderCapabilities.None);
         var service = CreateService(provider.Object);
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(
             () => service.PrepareSystemForMigration(NullLogger<JellyfinMigrationService>.Instance));
 
         Assert.Contains(DatabaseProviderKey.PostgreSql, exception.Message, StringComparison.Ordinal);
+        Assert.Contains("does not support the fast backup and restore operation", exception.Message, StringComparison.Ordinal);
+        provider.Verify(p => p.MigrationBackupFast(It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task PrepareSystemForMigration_VerifiedFreshEmptyDatabaseDoesNotRequireFastBackup()
+    {
+        WriteServerConfiguration(wizardCompleted: false);
+        await File.WriteAllBytesAsync(DatabasePath, [], TestContext.Current.CancellationToken);
+        var provider = CreatePostgreSqlProviderMock(DatabaseProviderCapabilities.None);
+        var service = CreateService(provider.Object);
+
+        await service.CheckFirstTimeRunOrMigration(_paths, new StartupOptions());
+        await service.PrepareSystemForMigration(NullLogger<JellyfinMigrationService>.Instance);
+
+        provider.Verify(p => p.MigrationBackupFast(It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task PrepareSystemForMigration_PartialSchemaWithOnlyCodeHistoryRequiresFastBackupCapability()
+    {
+        var provider = CreatePostgreSqlProviderMock(DatabaseProviderCapabilities.None);
+        var service = CreateService(provider.Object);
+        await using (var context = await CreateDbContextAsync())
+        {
+            var historyRepository = context.GetService<IHistoryRepository>();
+            await historyRepository.CreateIfNotExistsAsync(TestContext.Current.CancellationToken);
+            await context.Database.ExecuteSqlRawAsync(
+                "CREATE TABLE \"PartialApplicationSchema\" (\"Id\" INTEGER NOT NULL PRIMARY KEY)",
+                TestContext.Current.CancellationToken);
+            await context.Database.ExecuteSqlRawAsync(
+                historyRepository.GetInsertScript(new HistoryRow("202601010000000_ExistingCodeMigration", "test")),
+                TestContext.Current.CancellationToken);
+        }
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.PrepareSystemForMigration(NullLogger<JellyfinMigrationService>.Instance));
+
         Assert.Contains("does not support the fast backup and restore operation", exception.Message, StringComparison.Ordinal);
         provider.Verify(p => p.MigrationBackupFast(It.IsAny<CancellationToken>()), Times.Never);
     }
@@ -326,6 +354,22 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
         var factory = serviceProvider.GetRequiredService<IDbContextFactory<JellyfinDbContext>>();
         serviceProvider.GetRequiredService<IJellyfinDatabaseProvider>().DbContextFactory = factory;
         return ActivatorUtilities.CreateInstance<JellyfinMigrationService>(serviceProvider);
+    }
+
+    private Mock<IJellyfinDatabaseProvider> CreatePostgreSqlProviderMock(DatabaseProviderCapabilities capabilities)
+    {
+        var sqliteProvider = new SqliteDatabaseProvider(_paths, NullLogger<SqliteDatabaseProvider>.Instance);
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider.SetupGet(p => p.ProviderKey).Returns(DatabaseProviderKey.PostgreSql);
+        provider.SetupGet(p => p.Capabilities).Returns(capabilities);
+        provider
+            .Setup(p => p.Initialise(It.IsAny<DbContextOptionsBuilder>(), It.IsAny<DatabaseConfigurationOptions>()))
+            .Callback<DbContextOptionsBuilder, DatabaseConfigurationOptions>(sqliteProvider.Initialise);
+        provider.Setup(p => p.OnModelCreating(It.IsAny<ModelBuilder>())).Callback<ModelBuilder>(sqliteProvider.OnModelCreating);
+        provider
+            .Setup(p => p.ConfigureConventions(It.IsAny<ModelConfigurationBuilder>()))
+            .Callback<ModelConfigurationBuilder>(sqliteProvider.ConfigureConventions);
+        return provider;
     }
 
     private async Task<JellyfinDbContext> CreateDbContextAsync()
