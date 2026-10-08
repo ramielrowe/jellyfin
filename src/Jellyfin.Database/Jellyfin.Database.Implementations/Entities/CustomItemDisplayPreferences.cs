@@ -1,6 +1,8 @@
 using System;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Jellyfin.Database.Implementations.Entities
 {
@@ -9,6 +11,8 @@ namespace Jellyfin.Database.Implementations.Entities
     /// </summary>
     public class CustomItemDisplayPreferences
     {
+        private string _key = null!;
+
         /// <summary>
         /// Initializes a new instance of the <see cref="CustomItemDisplayPreferences"/> class.
         /// </summary>
@@ -67,7 +71,20 @@ namespace Jellyfin.Database.Implementations.Entities
         /// <remarks>
         /// Required.
         /// </remarks>
-        public string Key { get; set; }
+        public string Key
+        {
+            get => _key;
+            set
+            {
+                _key = value;
+                KeyDigest = SHA256.HashData(Encoding.UTF8.GetBytes(value));
+            }
+        }
+
+        /// <summary>
+        /// Gets the fixed-size UTF-8 digest used for PostgreSQL uniqueness enforcement.
+        /// </summary>
+        public byte[] KeyDigest { get; private set; } = null!;
 
         /// <summary>
         /// Gets or sets the preference value.

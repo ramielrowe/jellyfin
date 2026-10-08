@@ -8,6 +8,7 @@ using Jellyfin.Database.Implementations.Enums;
 using Jellyfin.Database.Providers.Sqlite.ValueConverters;
 using Jellyfin.Server.Implementations.Item;
 using MediaBrowser.Controller.Entities;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata;
 using Xunit;
 
@@ -28,7 +29,7 @@ public sealed class BaseItemRepositoryProviderParityTests : SqliteDbTestFixture
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public void SearchFilters_MatchOriginalTitleCaseInsensitively(bool useNameContains)
+    public void SearchFilters_MatchOriginalTitleAsciiCaseInsensitively(bool useNameContains)
     {
         var expectedId = Guid.NewGuid();
         Seed(CreateItem(expectedId, "Unrelated", "unrelated", "Unrelated", originalTitle: "THE Hidden TITLE"));
@@ -44,6 +45,26 @@ public sealed class BaseItemRepositoryProviderParityTests : SqliteDbTestFixture
         }
 
         Assert.Equal(expectedId, Assert.Single(_repository.GetItemList(query)).Id);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void SearchFilters_NonAsciiCaseFoldingIsExplicitlyUnsupported(bool useNameContains)
+    {
+        Seed(CreateItem(Guid.NewGuid(), "Unrelated", "unrelated", "Unrelated", originalTitle: "ÉTÉ"));
+
+        var query = Query();
+        if (useNameContains)
+        {
+            query.NameContains = "été";
+        }
+        else
+        {
+            query.SearchTerm = "été";
+        }
+
+        Assert.Empty(_repository.GetItemList(query));
     }
 
     [Theory]
@@ -128,8 +149,44 @@ public sealed class BaseItemRepositoryProviderParityTests : SqliteDbTestFixture
 
         Assert.Null(context.Model.FindEntityType(typeof(ItemValue))!.FindProperty(nameof(ItemValue.Value))!.GetMaxLength());
         Assert.Null(context.Model.FindEntityType(typeof(CustomItemDisplayPreferences))!.FindProperty(nameof(CustomItemDisplayPreferences.Key))!.GetMaxLength());
+        Assert.Null(context.Model.FindEntityType(typeof(ItemValue))!.FindProperty(nameof(ItemValue.ValueDigest)));
+        Assert.Null(context.Model.FindEntityType(typeof(CustomItemDisplayPreferences))!.FindProperty(nameof(CustomItemDisplayPreferences.KeyDigest)));
         Assert.Equal(longValue, Assert.Single(context.ItemValues).Value);
         Assert.Equal(longPreferenceKey, Assert.Single(context.CustomItemDisplayPreferences).Key);
+    }
+
+    [Fact]
+    public void ProviderIds_RemainUnboundedAndUniqueOnSqlite()
+    {
+        var item = CreateItem(Guid.NewGuid(), "Provider item", "provider item", "Provider item");
+        var providerId = "plugin-provider-" + new string('p', 12_000);
+        using (var context = CreateDbContext())
+        {
+            context.BaseItems.Add(item);
+            context.BaseItemProviders.Add(new BaseItemProvider
+            {
+                ItemId = item.Id,
+                Item = item,
+                ProviderId = providerId,
+                ProviderValue = "external-id"
+            });
+
+            context.SaveChanges();
+            context.ChangeTracker.Clear();
+
+            Assert.Null(context.Model.FindEntityType(typeof(BaseItemProvider))!.FindProperty(nameof(BaseItemProvider.ProviderIdDigest)));
+            Assert.Equal(providerId, Assert.Single(context.BaseItemProviders).ProviderId);
+        }
+
+        using var duplicateContext = CreateDbContext();
+        duplicateContext.BaseItemProviders.Add(new BaseItemProvider
+        {
+            ItemId = item.Id,
+            Item = null!,
+            ProviderId = providerId,
+            ProviderValue = "duplicate"
+        });
+        Assert.Throws<DbUpdateException>(() => duplicateContext.SaveChanges());
     }
 
     private void Seed(params BaseItemEntity[] items)

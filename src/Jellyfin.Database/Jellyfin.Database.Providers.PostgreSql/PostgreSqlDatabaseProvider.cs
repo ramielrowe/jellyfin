@@ -181,6 +181,14 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         var people = modelBuilder.Entity<People>();
         RemoveIndex(people.Metadata, nameof(People.Name));
         people.HasIndex(entity => entity.Name).HasMethod("hash");
+
+        // The import path compares normalized names repeatedly. PostgreSQL cannot use the Name
+        // hash index for lower(Name), so expose the normalized expression as a generated column
+        // and have the PostgreSQL query path address it directly.
+        people.Property<string>("NameLower")
+            .HasComputedColumnSql("lower(\"Name\")", stored: true)
+            .UseCollation("C");
+        people.HasIndex("NameLower").HasMethod("hash");
     }
 
     private static void ConfigureMediaStreamIndexes(ModelBuilder modelBuilder)
@@ -202,11 +210,13 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     private static void ConfigureProviderIdIndexes(ModelBuilder modelBuilder)
     {
         var providers = modelBuilder.Entity<BaseItemProvider>();
-        // ProviderId is a provider/plugin identifier and is part of the primary key. ProviderValue
-        // is external metadata and must stay unbounded.
-        providers.Property(entity => entity.ProviderId).HasMaxLength(128);
+        // Provider ids originate in plugins and are not bounded by a shared application contract.
+        // Use their client-computed SHA-256 digest in the physical key so PostgreSQL can enforce
+        // item/provider uniqueness without rejecting otherwise valid long identifiers.
+        providers.HasKey(entity => new { entity.ItemId, entity.ProviderIdDigest });
+        providers.Property(entity => entity.ProviderIdDigest).ValueGeneratedNever();
         RemoveIndex(providers.Metadata, nameof(BaseItemProvider.ProviderId), nameof(BaseItemProvider.ItemId), nameof(BaseItemProvider.ProviderValue));
-        providers.HasIndex(entity => new { entity.ProviderId, entity.ItemId });
+        providers.HasIndex(entity => entity.ProviderId).HasMethod("hash");
         providers.HasIndex(entity => entity.ProviderValue).HasMethod("hash");
     }
 
@@ -219,11 +229,11 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         itemValues.HasIndex(entity => entity.CleanValue).HasMethod("hash");
 
         // PostgreSQL cannot enforce uniqueness directly with a hash index and a B-tree cannot store
-        // arbitrary-length metadata. A stored full-value digest gives the unique index a fixed-size
-        // key without imposing a PostgreSQL-only varchar limit on Value.
-        itemValues.Property<byte[]>("ValueDigest")
-            .HasComputedColumnSql("sha256(\"Value\"::bytea)", stored: true);
-        itemValues.HasIndex(nameof(ItemValue.Type), "ValueDigest").IsUnique();
+        // arbitrary-length metadata. The entity setter computes SHA-256 over the UTF-8 text so the
+        // unique index has a fixed-size key. PostgreSQL marks convert_to(text, name) STABLE rather
+        // than IMMUTABLE, so the equivalent server-side generated expression is invalid DDL.
+        itemValues.Property(entity => entity.ValueDigest).ValueGeneratedNever();
+        itemValues.HasIndex(entity => new { entity.Type, entity.ValueDigest }).IsUnique();
     }
 
     private static void ConfigureCustomPreferenceIndexes(ModelBuilder modelBuilder)
@@ -238,13 +248,9 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
 
         // Preference keys are supplied by clients and are not a bounded identifier. Preserve their
         // uniqueness without changing SQLite validation or truncating valid PostgreSQL writes.
-        preferences.Property<byte[]>("KeyDigest")
-            .HasComputedColumnSql("sha256(\"Key\"::bytea)", stored: true);
+        preferences.Property(entity => entity.KeyDigest).ValueGeneratedNever();
         preferences.HasIndex(
-                nameof(CustomItemDisplayPreferences.UserId),
-                nameof(CustomItemDisplayPreferences.ItemId),
-                nameof(CustomItemDisplayPreferences.Client),
-                "KeyDigest")
+                entity => new { entity.UserId, entity.ItemId, entity.Client, entity.KeyDigest })
             .IsUnique();
     }
 

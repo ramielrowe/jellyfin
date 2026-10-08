@@ -168,7 +168,8 @@ public class PeopleRepository(IDbContextFactory<JellyfinDbContext> dbProvider, I
             .Where(e => e.ItemId == itemId)
             .ToList();
 
-        // Query each person type separately so SQLite can use IX_Peoples_NameLower.
+        // Query each person type separately so SQLite can use its lower(Name) expression index and
+        // PostgreSQL can use its generated NameLower-column index.
         // Combining the two fields into `lower(Name) || '-' || PersonType` forces a full
         // scan of Peoples for every media item, which is prohibitive during a large import.
         var existingPersons = new List<People>();
@@ -178,9 +179,11 @@ public class PeopleRepository(IDbContextFactory<JellyfinDbContext> dbProvider, I
                 .Select(e => e.LoweredName)
                 .ToArray();
 
-            existingPersons.AddRange(context.Peoples
-                .Where(e => e.PersonType == personTypeGroup.Key && names.Contains(e.Name.ToLower()))
-                .ToArray());
+            var peopleQuery = context.Peoples.Where(e => e.PersonType == personTypeGroup.Key);
+            existingPersons.AddRange(
+                UsesGeneratedPeopleNameLower(context)
+                    ? peopleQuery.Where(e => names.Contains(EF.Property<string>(e, "NameLower"))).ToArray()
+                    : peopleQuery.Where(e => names.Contains(e.Name.ToLower())).ToArray());
         }
 
         var existingPersonKeys = existingPersons.Select(e => (e.Name.ToLowerInvariant(), e.PersonType ?? string.Empty)).ToHashSet();
@@ -513,6 +516,12 @@ public class PeopleRepository(IDbContextFactory<JellyfinDbContext> dbProvider, I
 
         return true;
     }
+
+    private static bool UsesGeneratedPeopleNameLower(JellyfinDbContext context)
+        => string.Equals(
+            context.Database.ProviderName,
+            "Npgsql.EntityFrameworkCore.PostgreSQL",
+            StringComparison.Ordinal);
 
     private bool IsValidPersonType(string value)
     {

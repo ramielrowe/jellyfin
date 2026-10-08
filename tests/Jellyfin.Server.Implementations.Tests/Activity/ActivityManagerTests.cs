@@ -11,7 +11,7 @@ namespace Jellyfin.Server.Implementations.Tests.Activity;
 public sealed class ActivityManagerTests : SqliteDbTestFixture
 {
     [Fact]
-    public async Task GetPagedResultAsync_TextFiltersAreCaseInsensitive()
+    public async Task GetPagedResultAsync_AsciiTextFiltersAreCaseInsensitive()
     {
         using (var context = CreateDbContext())
         {
@@ -33,6 +33,23 @@ public sealed class ActivityManagerTests : SqliteDbTestFixture
         }).ConfigureAwait(true);
 
         Assert.Single(result.Items);
+    }
+
+    [Fact]
+    public async Task GetPagedResultAsync_NonAsciiCaseFoldingIsExplicitlyUnsupported()
+    {
+        using (var context = CreateDbContext())
+        {
+            context.ActivityLogs.Add(new ActivityLog("ÉVÉNEMENT", "Unicode", Guid.Empty));
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        var manager = new ActivityManager(CreateDbContextFactory());
+        var result = await manager.GetPagedResultAsync(new ActivityLogQuery { Name = "événement" }).ConfigureAwait(true);
+
+        // SQLite's built-in lower() and PostgreSQL's lower() under the C collation only provide
+        // the same deterministic folding contract for ASCII.
+        Assert.Empty(result.Items);
     }
 
     [Fact]

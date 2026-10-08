@@ -39,7 +39,7 @@ public sealed class PeopleRepositoryNameRangeTests : SqliteDbTestFixture
     [InlineData(null, "C", new[] { "50 Cent", "alpha centauri", "bob dylan", "Brad Pitt" })]
     [InlineData("B", "C", new[] { "bob dylan", "Brad Pitt" })]
     [InlineData("Y", null, new[] { "Zoe Saldana", "éclair" })]
-    public void GetPeople_NameRange_IgnoresCase(string? nameStartsWithOrGreater, string? nameLessThan, string[] expected)
+    public void GetPeople_NameRange_IgnoresAsciiCase(string? nameStartsWithOrGreater, string? nameLessThan, string[] expected)
     {
         var result = _repository.GetPeople(new InternalPeopleQuery
         {
@@ -54,7 +54,7 @@ public sealed class PeopleRepositoryNameRangeTests : SqliteDbTestFixture
     [Theory]
     [InlineData("BR", new[] { "Brad Pitt" })]
     [InlineData("bo", new[] { "bob dylan" })]
-    public void GetPeople_NameStartsWith_IgnoresCase(string nameStartsWith, string[] expected)
+    public void GetPeople_NameStartsWith_IgnoresAsciiCase(string nameStartsWith, string[] expected)
     {
         var result = _repository.GetPeople(new InternalPeopleQuery
         {
@@ -74,5 +74,19 @@ public sealed class PeopleRepositoryNameRangeTests : SqliteDbTestFixture
         });
 
         Assert.Equal("éclair", Assert.Single(result.Items).Name);
+    }
+
+    [Fact]
+    public void GetPeople_NonAsciiCaseFoldingIsExplicitlyUnsupported()
+    {
+        using (var context = CreateDbContext())
+        {
+            context.Peoples.Add(new People { Id = Guid.NewGuid(), Name = "Élodie", PersonType = "Actor" });
+            context.SaveChanges();
+        }
+
+        var result = _repository.GetPeople(new InternalPeopleQuery { NameStartsWith = "é" });
+
+        Assert.DoesNotContain(result.Items, person => person.Name == "Élodie");
     }
 }

@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Emby.Server.Implementations.Data;
@@ -107,6 +109,8 @@ public sealed class PostgreSqlModelCompatibilityTests
 
         var people = AssertEntityType<People>(model);
         AssertIndex(people, "hash", nameof(People.Name));
+        AssertIndex(people, "hash", "NameLower");
+        Assert.Equal("lower(\"Name\")", people.FindProperty("NameLower")!.GetComputedColumnSql());
         Assert.Equal("C", people.FindProperty(nameof(People.Name))!.GetCollation());
 
         var streams = AssertEntityType<MediaStreamInfo>(model);
@@ -119,14 +123,19 @@ public sealed class PostgreSqlModelCompatibilityTests
         AssertIndex(devices, null, nameof(Device.UserId), nameof(Device.DeviceId));
 
         var providers = AssertEntityType<BaseItemProvider>(model);
-        AssertIndex(providers, null, nameof(BaseItemProvider.ProviderId), nameof(BaseItemProvider.ItemId));
+        AssertIndex(providers, "hash", nameof(BaseItemProvider.ProviderId));
         AssertIndex(providers, "hash", nameof(BaseItemProvider.ProviderValue));
+        Assert.Null(providers.FindProperty(nameof(BaseItemProvider.ProviderId))!.GetMaxLength());
+        Assert.Equal(
+            new[] { nameof(BaseItemProvider.ItemId), nameof(BaseItemProvider.ProviderIdDigest) },
+            providers.FindPrimaryKey()!.Properties.Select(property => property.Name));
 
         var itemValues = AssertEntityType<ItemValue>(model);
         AssertIndex(itemValues, null, nameof(ItemValue.Type));
         AssertIndex(itemValues, "hash", nameof(ItemValue.CleanValue));
-        Assert.True(AssertIndex(itemValues, null, nameof(ItemValue.Type), "ValueDigest").IsUnique);
+        Assert.True(AssertIndex(itemValues, null, nameof(ItemValue.Type), nameof(ItemValue.ValueDigest)).IsUnique);
         Assert.Null(itemValues.FindProperty(nameof(ItemValue.Value))!.GetMaxLength());
+        Assert.Null(itemValues.FindProperty(nameof(ItemValue.ValueDigest))!.GetComputedColumnSql());
 
         var customPreferences = AssertEntityType<CustomItemDisplayPreferences>(model);
         Assert.True(AssertIndex(
@@ -135,8 +144,9 @@ public sealed class PostgreSqlModelCompatibilityTests
             nameof(CustomItemDisplayPreferences.UserId),
             nameof(CustomItemDisplayPreferences.ItemId),
             nameof(CustomItemDisplayPreferences.Client),
-            "KeyDigest").IsUnique);
+            nameof(CustomItemDisplayPreferences.KeyDigest)).IsUnique);
         Assert.Null(customPreferences.FindProperty(nameof(CustomItemDisplayPreferences.Key))!.GetMaxLength());
+        Assert.Null(customPreferences.FindProperty(nameof(CustomItemDisplayPreferences.KeyDigest))!.GetComputedColumnSql());
 
         var activity = AssertEntityType<ActivityLog>(model);
         Assert.Equal("C", activity.FindProperty(nameof(ActivityLog.Name))!.GetCollation());
@@ -266,6 +276,108 @@ public sealed class PostgreSqlModelCompatibilityTests
     }
 
     [Fact]
+    public async Task TextDigests_HashUtf8TextWithoutInterpretingBackslashSequences()
+    {
+        var context = await CreateSchemaAsync().ConfigureAwait(true);
+        var database = await _fixture.GetDatabaseAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        var userId = Guid.Empty;
+        var itemId = Guid.NewGuid();
+        var values = new[] { "A", @"\x41", @"\q" };
+        var updatedValues = new[] { "B", @"\x41", @"\q" };
+        await using (context.ConfigureAwait(true))
+        {
+            var user = new User("digest-values", "test-auth", "test-reset");
+            userId = user.Id;
+            context.Users.Add(user);
+            context.ItemValues.AddRange(values.Select(CreateItemValue));
+            context.CustomItemDisplayPreferences.AddRange(
+                values.Select(key => new CustomItemDisplayPreferences(user.Id, itemId, "test-client", key, "value")));
+
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+
+            foreach (var value in values)
+            {
+                Assert.Equal(
+                    SHA256.HashData(Encoding.UTF8.GetBytes(value)),
+                    (await context.ItemValues.SingleAsync(itemValue => itemValue.Value == value, TestContext.Current.CancellationToken).ConfigureAwait(true)).ValueDigest);
+                Assert.Equal(
+                    SHA256.HashData(Encoding.UTF8.GetBytes(value)),
+                    (await context.CustomItemDisplayPreferences.SingleAsync(preference => preference.Key == value, TestContext.Current.CancellationToken).ConfigureAwait(true)).KeyDigest);
+            }
+
+            (await context.ItemValues.SingleAsync(value => value.Value == "A", TestContext.Current.CancellationToken).ConfigureAwait(true)).Value = "B";
+            (await context.CustomItemDisplayPreferences.SingleAsync(preference => preference.Key == "A", TestContext.Current.CancellationToken).ConfigureAwait(true)).Key = "B";
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+            context.ChangeTracker.Clear();
+
+            Assert.Equal(
+                updatedValues.ToHashSet(StringComparer.Ordinal),
+                (await context.ItemValues.Select(value => value.Value).ToArrayAsync(TestContext.Current.CancellationToken).ConfigureAwait(true)).ToHashSet(StringComparer.Ordinal));
+            Assert.Equal(
+                updatedValues.ToHashSet(StringComparer.Ordinal),
+                (await context.CustomItemDisplayPreferences.Select(preference => preference.Key).ToArrayAsync(TestContext.Current.CancellationToken).ConfigureAwait(true)).ToHashSet(StringComparer.Ordinal));
+
+            // Updating a value must update its digest as well, leaving the old key reusable.
+            context.ItemValues.Add(CreateItemValue("A"));
+            context.CustomItemDisplayPreferences.Add(
+                new CustomItemDisplayPreferences(user.Id, itemId, "test-client", "A", "replacement"));
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        await using (var duplicateValueContext = database.CreateDbContext())
+        {
+            duplicateValueContext.ItemValues.Add(CreateItemValue(@"\x41"));
+            await Assert.ThrowsAsync<DbUpdateException>(
+                () => duplicateValueContext.SaveChangesAsync(TestContext.Current.CancellationToken)).ConfigureAwait(true);
+        }
+
+        await using var duplicatePreferenceContext = database.CreateDbContext();
+        duplicatePreferenceContext.CustomItemDisplayPreferences.Add(
+            new CustomItemDisplayPreferences(userId, itemId, "test-client", @"\q", "duplicate"));
+        await Assert.ThrowsAsync<DbUpdateException>(
+            () => duplicatePreferenceContext.SaveChangesAsync(TestContext.Current.CancellationToken)).ConfigureAwait(true);
+    }
+
+    [Fact]
+    public async Task ProviderIds_AreUnboundedAndRemainUniquePerItem()
+    {
+        var context = await CreateSchemaAsync().ConfigureAwait(true);
+        var database = await _fixture.GetDatabaseAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        var itemId = Guid.NewGuid();
+        var providerId = "plugin-provider-" + new string('p', 12_000);
+        await using (context.ConfigureAwait(true))
+        {
+            var item = CreateItem(itemId, "Movie", false);
+            context.BaseItems.Add(item);
+            context.BaseItemProviders.Add(new BaseItemProvider
+            {
+                ItemId = itemId,
+                Item = item,
+                ProviderId = providerId,
+                ProviderValue = "external-id"
+            });
+
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+            context.ChangeTracker.Clear();
+
+            var storedProvider = await context.BaseItemProviders.SingleAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+            Assert.Equal(providerId, storedProvider.ProviderId);
+            Assert.Equal(SHA256.HashData(Encoding.UTF8.GetBytes(providerId)), storedProvider.ProviderIdDigest);
+        }
+
+        await using var duplicateContext = database.CreateDbContext();
+        duplicateContext.BaseItemProviders.Add(new BaseItemProvider
+        {
+            ItemId = itemId,
+            Item = null!,
+            ProviderId = providerId,
+            ProviderValue = "duplicate"
+        });
+        await Assert.ThrowsAsync<DbUpdateException>(
+            () => duplicateContext.SaveChangesAsync(TestContext.Current.CancellationToken)).ConfigureAwait(true);
+    }
+
+    [Fact]
     public async Task PostgreSqlPlanner_UsesRepresentativeProviderSpecificIndexes()
     {
         var context = await CreateSchemaAsync().ConfigureAwait(true);
@@ -280,11 +392,39 @@ public sealed class PostgreSqlModelCompatibilityTests
             var streamPlan = await ExplainAsync(
                 context,
                 "SELECT \"ItemId\" FROM \"MediaStreamInfos\" WHERE \"StreamType\" = 0 AND \"Language\" = 'eng' AND NOT \"IsExternal\"").ConfigureAwait(true);
+            var peopleNamePlan = await ExplainAsync(
+                context,
+                "SELECT \"Id\" FROM \"Peoples\" WHERE \"PersonType\" = 'Actor' AND \"NameLower\" = ANY (ARRAY['needle'])").ConfigureAwait(true);
 
             Assert.Contains("IX_BaseItems_CleanName", cleanNamePlan, StringComparison.Ordinal);
             Assert.Contains("IX_Devices_DeviceId_DateLastActivity", devicePlan, StringComparison.Ordinal);
             Assert.Contains("IX_MediaStreamInfos_StreamType_ItemId_Language_IsExternal", streamPlan, StringComparison.Ordinal);
+            Assert.Contains("IX_Peoples_NameLower", peopleNamePlan, StringComparison.Ordinal);
         }
+    }
+
+    [Fact]
+    public async Task UpdatePeople_UsesNormalizedNameColumnAndReusesAsciiCaseVariant()
+    {
+        var context = await CreateSchemaAsync().ConfigureAwait(true);
+        var database = await _fixture.GetDatabaseAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        var itemId = Guid.NewGuid();
+        await using (context.ConfigureAwait(true))
+        {
+            context.BaseItems.Add(CreateItem(itemId, "Movie", false));
+            context.Peoples.Add(new People { Id = Guid.NewGuid(), Name = "ALICE", PersonType = nameof(PersonKind.Actor) });
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        var repository = new PeopleRepository(
+            CreateDbContextFactory(database),
+            new ItemTypeLookup(),
+            new Mock<IItemQueryHelpers>().Object);
+        repository.UpdatePeople(itemId, [new PersonInfo { Name = "alice", Type = PersonKind.Actor }]);
+
+        await using var verificationContext = database.CreateDbContext();
+        Assert.Equal("ALICE", Assert.Single(await verificationContext.Peoples.ToArrayAsync(TestContext.Current.CancellationToken).ConfigureAwait(true)).Name);
+        Assert.Single(await verificationContext.PeopleBaseItemMap.ToArrayAsync(TestContext.Current.CancellationToken).ConfigureAwait(true));
     }
 
     [Fact]
@@ -426,6 +566,41 @@ public sealed class PostgreSqlModelCompatibilityTests
         }).ConfigureAwait(true);
 
         Assert.Single(result.Items);
+    }
+
+    [Fact]
+    public async Task TextFilters_HaveExplicitAsciiOnlyCaseFoldingOnPostgreSql()
+    {
+        var context = await CreateSchemaAsync().ConfigureAwait(true);
+        var database = await _fixture.GetDatabaseAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        var itemTypeLookup = new ItemTypeLookup();
+        var movieType = itemTypeLookup.BaseItemKindNames[BaseItemKind.Movie];
+        await using (context.ConfigureAwait(true))
+        {
+            context.ActivityLogs.Add(new ActivityLog("ÉVÉNEMENT", "Unicode", Guid.Empty));
+            context.Peoples.Add(new People { Id = Guid.NewGuid(), Name = "Élodie", PersonType = "Actor" });
+            context.BaseItems.Add(CreateSearchItem(Guid.NewGuid(), movieType, "Unrelated", "unrelated", "Unrelated", "ÉTÉ"));
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        // PostgreSQL's C collation and SQLite's built-in lower() agree for ASCII but do not
+        // provide general Unicode case folding. Keep that limitation explicit until Jellyfin has
+        // a shared, persisted Unicode normalization contract.
+        var activityManager = new ActivityManager(CreateDbContextFactory(database));
+        Assert.Empty((await activityManager.GetPagedResultAsync(new ActivityLogQuery { Name = "événement" }).ConfigureAwait(true)).Items);
+
+        var peopleRepository = new PeopleRepository(
+            CreateDbContextFactory(database),
+            itemTypeLookup,
+            new Mock<IItemQueryHelpers>().Object);
+        Assert.Empty(peopleRepository.GetPeople(new InternalPeopleQuery { NameStartsWith = "é" }).Items);
+
+        var itemRepository = CreateRepository(database, itemTypeLookup);
+        Assert.Empty(itemRepository.GetItemList(Query(searchTerm: "été")));
+        var searchProvider = CreateSearchProvider(database, itemTypeLookup, itemRepository);
+        Assert.Empty(await searchProvider.SearchAsync(
+            new SearchProviderQuery { SearchTerm = "été" },
+            TestContext.Current.CancellationToken).ConfigureAwait(true));
     }
 
     [Fact]

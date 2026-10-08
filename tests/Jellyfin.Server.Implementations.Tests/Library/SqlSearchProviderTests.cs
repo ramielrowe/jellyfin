@@ -113,6 +113,22 @@ public sealed class SqlSearchProviderTests : SqliteDbTestFixture
     }
 
     [Fact]
+    public async Task SearchAsync_NonAsciiCaseFoldingIsExplicitlyUnsupported()
+    {
+        using (var context = CreateDbContext())
+        {
+            context.BaseItems.Add(CreateSearchItem(Guid.NewGuid(), "Unrelated", "unrelated", "Unrelated", "ÉTÉ"));
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        var results = await _provider.SearchAsync(
+            new SearchProviderQuery { SearchTerm = "été" },
+            TestContext.Current.CancellationToken).ConfigureAwait(true);
+
+        Assert.Empty(results);
+    }
+
+    [Fact]
     public async Task SearchAsync_LikeMetacharacters_AreLiteral()
     {
         var literalId = Guid.NewGuid();
