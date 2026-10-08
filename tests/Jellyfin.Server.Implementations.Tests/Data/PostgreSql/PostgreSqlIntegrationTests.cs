@@ -75,6 +75,28 @@ public sealed class PostgreSqlIntegrationTests
     }
 
     [Fact]
+    public async Task CreateAsync_CallbackFailureAfterDatabaseCreationDropsDatabase()
+    {
+        SkipUnlessConfigured();
+        const string CallbackFailureMessage = "Test database-created callback failed.";
+        string? databaseName = null;
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => _fixture.CreateIsolatedDatabaseAsync(
+                TestContext.Current.CancellationToken,
+                createdDatabaseName =>
+                {
+                    databaseName = createdDatabaseName;
+                    throw new InvalidOperationException(CallbackFailureMessage);
+                })).ConfigureAwait(true);
+
+        Assert.Equal(CallbackFailureMessage, exception.Message);
+        Assert.NotNull(databaseName);
+        Assert.True(PostgreSqlTestDatabase.IsOwnedDatabaseName(databaseName));
+        Assert.False(await _fixture.DatabaseExistsAsync(databaseName, TestContext.Current.CancellationToken).ConfigureAwait(true));
+    }
+
+    [Fact]
     public async Task DisposeAsync_DropsOnlyCreatedDatabase()
     {
         SkipUnlessConfigured();

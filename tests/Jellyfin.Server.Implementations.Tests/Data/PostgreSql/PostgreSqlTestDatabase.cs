@@ -52,6 +52,7 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         var databaseName = CreateDatabaseName();
         NpgsqlDataSource? administratorDataSource = null;
         NpgsqlDataSource? testDataSource = null;
+        var createDatabaseAttempted = false;
 
         try
         {
@@ -60,6 +61,7 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
             await using (var command = connection.CreateCommand())
             {
                 command.CommandText = "CREATE DATABASE " + QuoteOwnedDatabaseName(databaseName);
+                createDatabaseAttempted = true;
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
 
@@ -89,7 +91,12 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            if (!await CleanupFailedCreationAsync(testDataSource, administratorDataSource, databaseName).ConfigureAwait(false))
+            if (!await CleanupFailedCreationAsync(
+                    testDataSource,
+                    administratorDataSource,
+                    databaseName,
+                    createDatabaseAttempted).ConfigureAwait(false)
+                && createDatabaseAttempted)
             {
                 throw CreateCleanupFailureException(databaseName);
             }
@@ -98,7 +105,12 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         }
         catch (NpgsqlException)
         {
-            if (!await CleanupFailedCreationAsync(testDataSource, administratorDataSource, databaseName).ConfigureAwait(false))
+            if (!await CleanupFailedCreationAsync(
+                    testDataSource,
+                    administratorDataSource,
+                    databaseName,
+                    createDatabaseAttempted).ConfigureAwait(false)
+                && createDatabaseAttempted)
             {
                 throw CreateCleanupFailureException(databaseName);
             }
@@ -106,6 +118,20 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
             throw new InvalidOperationException(
                 "Unable to create an isolated PostgreSQL test database. Verify that the configured server is reachable "
                 + "and that the test role has CREATEDB permission.");
+        }
+        catch (Exception)
+        {
+            if (!await CleanupFailedCreationAsync(
+                    testDataSource,
+                    administratorDataSource,
+                    databaseName,
+                    createDatabaseAttempted).ConfigureAwait(false)
+                && createDatabaseAttempted)
+            {
+                throw CreateCleanupFailureException(databaseName);
+            }
+
+            throw;
         }
     }
 
@@ -324,20 +350,41 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
     private static async Task<bool> CleanupFailedCreationAsync(
         NpgsqlDataSource? testDataSource,
         NpgsqlDataSource? administratorDataSource,
-        string databaseName)
+        string databaseName,
+        bool createDatabaseAttempted)
     {
-        if (testDataSource is not null)
+        var cleanupSucceeded = true;
+
+        try
         {
-            await testDataSource.DisposeAsync().ConfigureAwait(false);
+            if (testDataSource is not null)
+            {
+                await testDataSource.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+        catch (Exception)
+        {
+            cleanupSucceeded = false;
         }
 
-        if (administratorDataSource is null)
+        if (administratorDataSource is not null)
         {
-            return true;
+            if (createDatabaseAttempted
+                && !await TryDropOwnedDatabaseAsync(administratorDataSource, databaseName).ConfigureAwait(false))
+            {
+                cleanupSucceeded = false;
+            }
+
+            try
+            {
+                await administratorDataSource.DisposeAsync().ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                cleanupSucceeded = false;
+            }
         }
 
-        var cleanupSucceeded = await TryDropOwnedDatabaseAsync(administratorDataSource, databaseName).ConfigureAwait(false);
-        await administratorDataSource.DisposeAsync().ConfigureAwait(false);
         return cleanupSucceeded;
     }
 
@@ -348,7 +395,7 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
             await DropOwnedDatabaseAsync(administratorDataSource, databaseName, CancellationToken.None).ConfigureAwait(false);
             return true;
         }
-        catch (NpgsqlException)
+        catch (Exception)
         {
             return false;
         }
