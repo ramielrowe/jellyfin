@@ -1,14 +1,28 @@
 using System;
+using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
+using Emby.Server.Implementations;
+using Emby.Server.Implementations.Serialization;
+using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Database.Providers.PostgreSql;
 using Jellyfin.Database.Providers.PostgreSql.Migrations;
+using Jellyfin.Server.Migrations;
+using Jellyfin.Server.Migrations.Routines;
+using Jellyfin.Server.Migrations.Stages;
+using Jellyfin.Server.ServerSetupApp;
+using MediaBrowser.Model.Configuration;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 using Xunit;
 
 namespace Jellyfin.Server.Implementations.Tests.Data.PostgreSql;
@@ -77,6 +91,139 @@ public sealed class PostgreSqlMigrationTests
             await database.ExecuteScalarAsync<long>(
                 "SELECT count(*) FROM \"__EFMigrationsHistory\"",
                 cancellationToken).ConfigureAwait(true));
+    }
+
+    [Fact]
+    public async Task Startup_FreshPreCreatedDatabaseSeedsHistoryAndNormalRestartIsStable()
+    {
+        Assert.SkipUnless(_fixture.IsConfigured, _fixture.SkipReason);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var database = await _fixture.GetDatabaseAsync(cancellationToken).ConfigureAwait(true);
+        await database.ResetAsync(cancellationToken).ConfigureAwait(true);
+        var root = Path.Combine(Path.GetTempPath(), "jellyfin-postgresql-startup-tests", Guid.NewGuid().ToString("N"));
+        var paths = new ServerApplicationPaths(
+            Path.Combine(root, "data"),
+            Path.Combine(root, "log"),
+            Path.Combine(root, "config"),
+            Path.Combine(root, "cache"),
+            Path.Combine(root, "web"));
+        Directory.CreateDirectory(paths.DataPath);
+        Directory.CreateDirectory(paths.LogDirectoryPath);
+        Directory.CreateDirectory(paths.ConfigurationDirectoryPath);
+        Directory.CreateDirectory(paths.CachePath);
+
+        try
+        {
+            new MyXmlSerializer().SerializeToFile(
+                new ServerConfiguration { IsStartupWizardCompleted = false },
+                paths.SystemConfigurationFilePath);
+            var provider = new PostgreSqlDatabaseProvider(NullLogger<PostgreSqlDatabaseProvider>.Instance);
+            var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
+            factory
+                .Setup(contextFactory => contextFactory.CreateDbContextAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(database.CreateDbContext);
+            var migrationService = new JellyfinMigrationService(
+                factory.Object,
+                NullLoggerFactory.Instance,
+                new StartupLogger<JellyfinMigrationService>(NullLogger<JellyfinMigrationService>.Instance),
+                paths,
+                jellyfinDatabaseProvider: provider);
+            using var services = new ServiceCollection().BuildServiceProvider();
+
+            await migrationService.CheckFirstTimeRunOrMigration(paths, new StartupOptions()).ConfigureAwait(true);
+
+            await using (var seededContext = database.CreateDbContext())
+            {
+                var seededMigrationIds = await seededContext.GetService<IHistoryRepository>()
+                    .GetAppliedMigrationsAsync(cancellationToken)
+                    .ConfigureAwait(true);
+                Assert.Contains(seededMigrationIds, row => row.MigrationId.EndsWith("_StripEmbeddedLinkedChildren", StringComparison.Ordinal));
+                Assert.DoesNotContain(seededMigrationIds, row => row.MigrationId.EndsWith("_InitialPostgreSqlBaseline", StringComparison.Ordinal));
+            }
+
+            await migrationService.PrepareSystemForMigration(NullLogger.Instance).ConfigureAwait(true);
+            Assert.True(await migrationService.MigrateStepAsync(JellyfinMigrationStageTypes.CoreInitialisation, services).ConfigureAwait(true));
+
+            string[] firstStartupHistory;
+            await using (var migratedContext = database.CreateDbContext())
+            {
+                firstStartupHistory = (await migratedContext.GetService<IHistoryRepository>()
+                        .GetAppliedMigrationsAsync(cancellationToken)
+                        .ConfigureAwait(true))
+                    .Select(row => row.MigrationId)
+                    .Order(StringComparer.Ordinal)
+                    .ToArray();
+                Assert.Contains(firstStartupHistory, migrationId => migrationId.EndsWith("_InitialPostgreSqlBaseline", StringComparison.Ordinal));
+            }
+
+            new MyXmlSerializer().SerializeToFile(
+                new ServerConfiguration { IsStartupWizardCompleted = true },
+                paths.SystemConfigurationFilePath);
+            await migrationService.CheckFirstTimeRunOrMigration(paths, new StartupOptions()).ConfigureAwait(true);
+            Assert.False(await migrationService.MigrateStepAsync(JellyfinMigrationStageTypes.CoreInitialisation, services).ConfigureAwait(true));
+
+            await using var restartedContext = database.CreateDbContext();
+            Assert.Equal(
+                firstStartupHistory,
+                (await restartedContext.GetService<IHistoryRepository>()
+                        .GetAppliedMigrationsAsync(cancellationToken)
+                        .ConfigureAwait(true))
+                    .Select(row => row.MigrationId)
+                    .Order(StringComparer.Ordinal));
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public async Task Startup_MissingPostgreSqlDatabaseFailsWithoutCreatingIt()
+    {
+        Assert.SkipUnless(_fixture.IsConfigured, _fixture.SkipReason);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var database = await _fixture.GetDatabaseAsync(cancellationToken).ConfigureAwait(true);
+        var missingDatabaseName = PostgreSqlTestDatabase.CreateDatabaseName();
+        var root = Path.Combine(Path.GetTempPath(), "jellyfin-postgresql-missing-database-tests", Guid.NewGuid().ToString("N"));
+        var paths = new ServerApplicationPaths(
+            Path.Combine(root, "data"),
+            Path.Combine(root, "log"),
+            Path.Combine(root, "config"),
+            Path.Combine(root, "cache"),
+            Path.Combine(root, "web"));
+        Directory.CreateDirectory(paths.DataPath);
+        Directory.CreateDirectory(paths.LogDirectoryPath);
+        Directory.CreateDirectory(paths.ConfigurationDirectoryPath);
+        Directory.CreateDirectory(paths.CachePath);
+
+        try
+        {
+            new MyXmlSerializer().SerializeToFile(
+                new ServerConfiguration { IsStartupWizardCompleted = false },
+                paths.SystemConfigurationFilePath);
+            var provider = new PostgreSqlDatabaseProvider(NullLogger<PostgreSqlDatabaseProvider>.Instance);
+            var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
+            factory
+                .Setup(contextFactory => contextFactory.CreateDbContextAsync(It.IsAny<CancellationToken>()))
+                .ReturnsAsync(() => database.CreateDbContextForDatabase(missingDatabaseName));
+            var migrationService = new JellyfinMigrationService(
+                factory.Object,
+                NullLoggerFactory.Instance,
+                new StartupLogger<JellyfinMigrationService>(NullLogger<JellyfinMigrationService>.Instance),
+                paths,
+                jellyfinDatabaseProvider: provider);
+
+            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+                () => migrationService.CheckFirstTimeRunOrMigration(paths, new StartupOptions())).ConfigureAwait(true);
+
+            Assert.Contains("Create the configured database", exception.Message, StringComparison.Ordinal);
+            Assert.Contains("does not require or use PostgreSQL CREATEDB", exception.Message, StringComparison.Ordinal);
+            Assert.False(await _fixture.DatabaseExistsAsync(missingDatabaseName, cancellationToken).ConfigureAwait(true));
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
     }
 
     [Fact]
@@ -297,6 +444,71 @@ public sealed class PostgreSqlMigrationTests
         {
             Assert.False(await context.BaseItems.AnyAsync(item => item.Id.Equals(childId), cancellationToken).ConfigureAwait(true));
         }
+    }
+
+    [Fact]
+    public async Task StripEmbeddedLinkedChildren_UsesPortableTransformOnPostgreSql()
+    {
+        Assert.SkipUnless(_fixture.IsConfigured, _fixture.SkipReason);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var database = await _fixture.GetDatabaseAsync(cancellationToken).ConfigureAwait(true);
+        await database.ResetAsync(cancellationToken).ConfigureAwait(true);
+        var migratedId = Guid.NewGuid();
+        var malformedId = Guid.NewGuid();
+        const string MalformedData = "{\"LinkedChildren\":";
+
+        await using (var context = database.CreateDbContext())
+        {
+            await context.Database.MigrateAsync(cancellationToken).ConfigureAwait(true);
+            context.BaseItems.AddRange(
+                new BaseItemEntity
+                {
+                    Id = migratedId,
+                    Type = "Movie",
+                    Data = "{\"Name\":\"kept\",\"LinkedChildren\":[1],\"ExtraIds\":{},\"SupportsExternalTransfer\":true}"
+                },
+                new BaseItemEntity { Id = malformedId, Type = "Movie", Data = MalformedData });
+            await context.SaveChangesAsync(cancellationToken).ConfigureAwait(true);
+        }
+
+        var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
+        factory.Setup(contextFactory => contextFactory.CreateDbContext()).Returns(database.CreateDbContext);
+        new StripEmbeddedLinkedChildren(NullLoggerFactory.Instance, factory.Object).Perform();
+
+        await using var verification = database.CreateDbContext();
+        var migrated = JsonNode.Parse((await verification.BaseItems.FindAsync([migratedId], cancellationToken).ConfigureAwait(true))!.Data!)!.AsObject();
+        Assert.Equal("kept", migrated["Name"]!.GetValue<string>());
+        Assert.False(migrated.ContainsKey("LinkedChildren"));
+        Assert.False(migrated.ContainsKey("ExtraIds"));
+        Assert.False(migrated.ContainsKey("SupportsExternalTransfer"));
+        Assert.Equal(
+            MalformedData,
+            (await verification.BaseItems.FindAsync([malformedId], cancellationToken).ConfigureAwait(true))!.Data);
+    }
+
+    [Fact]
+    public async Task NoLock_AllowsIndependentConcurrentWritesOnPostgreSql()
+    {
+        Assert.SkipUnless(_fixture.IsConfigured, _fixture.SkipReason);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var database = await _fixture.GetDatabaseAsync(cancellationToken).ConfigureAwait(true);
+        await database.ResetAsync(cancellationToken).ConfigureAwait(true);
+
+        await using (var context = database.CreateDbContext())
+        {
+            await context.Database.MigrateAsync(cancellationToken).ConfigureAwait(true);
+        }
+
+        var ids = Enumerable.Range(0, 32).Select(_ => Guid.NewGuid()).ToArray();
+        await Task.WhenAll(ids.Select(async id =>
+        {
+            await using var context = database.CreateDbContext();
+            context.BaseItems.Add(new BaseItemEntity { Id = id, Type = "Movie" });
+            await context.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+        })).ConfigureAwait(true);
+
+        await using var verification = database.CreateDbContext();
+        Assert.Equal(32, await verification.BaseItems.CountAsync(item => ids.Contains(item.Id), cancellationToken).ConfigureAwait(true));
     }
 
     [Fact]

@@ -123,6 +123,8 @@ public static class ServiceCollectionExtensions
             }
         }
 
+        ValidateLockingBehavior(efCoreConfiguration.DatabaseType, efCoreConfiguration.LockingBehavior);
+
         serviceCollection.AddSingleton<IJellyfinDatabaseProvider>(providerFactory!);
 
         switch (efCoreConfiguration.LockingBehavior)
@@ -136,6 +138,8 @@ public static class ServiceCollectionExtensions
             case DatabaseLockingBehaviorTypes.Optimistic:
                 serviceCollection.AddSingleton<IEntityFrameworkCoreLockingBehavior, OptimisticLockBehavior>();
                 break;
+            default:
+                throw new InvalidOperationException($"The database locking behavior '{efCoreConfiguration.LockingBehavior}' is not supported.");
         }
 
         serviceCollection.AddPooledDbContextFactory<JellyfinDbContext>((serviceProvider, opt) =>
@@ -147,5 +151,16 @@ public static class ServiceCollectionExtensions
         });
 
         return serviceCollection;
+    }
+
+    private static void ValidateLockingBehavior(string databaseType, DatabaseLockingBehaviorTypes lockingBehavior)
+    {
+        if (databaseType.Equals(DatabaseProviderKey.PostgreSql, StringComparison.OrdinalIgnoreCase)
+            && lockingBehavior is not DatabaseLockingBehaviorTypes.NoLock)
+        {
+            throw new InvalidOperationException(
+                $"Database provider '{DatabaseProviderKey.PostgreSql}' requires the '{DatabaseLockingBehaviorTypes.NoLock}' locking behavior. "
+                + "PostgreSQL provides its own concurrent transaction locking; Jellyfin's pessimistic lock and SQLite lock-message retry modes are not compatible.");
+        }
     }
 }

@@ -146,6 +146,23 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
+        return CreateDbContext(_connectionString);
+    }
+
+    public JellyfinDbContext CreateDbContextForDatabase(string databaseName)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var connectionStringBuilder = new NpgsqlConnectionStringBuilder(_administratorConnectionString)
+        {
+            Database = databaseName,
+            Pooling = false
+        };
+
+        return CreateDbContext(connectionStringBuilder.ConnectionString);
+    }
+
+    private static JellyfinDbContext CreateDbContext(string connectionString)
+    {
         var provider = new PostgreSqlDatabaseProvider(NullLogger<PostgreSqlDatabaseProvider>.Instance);
         var optionsBuilder = new DbContextOptionsBuilder<JellyfinDbContext>();
         provider.Initialise(
@@ -157,7 +174,7 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
                 {
                     PluginName = string.Empty,
                     PluginAssembly = string.Empty,
-                    ConnectionString = _connectionString
+                    ConnectionString = connectionString
                 }
             });
 

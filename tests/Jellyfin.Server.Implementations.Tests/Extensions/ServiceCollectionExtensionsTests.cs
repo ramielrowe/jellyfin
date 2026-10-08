@@ -2,6 +2,7 @@ using System;
 using System.Collections.ObjectModel;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
+using Jellyfin.Database.Implementations.Locking;
 using Jellyfin.Database.Providers.PostgreSql;
 using Jellyfin.Database.Providers.Sqlite;
 using Jellyfin.Server.Implementations.Extensions;
@@ -140,6 +141,48 @@ public class ServiceCollectionExtensionsTests
         using var provider = services.BuildServiceProvider();
 
         Assert.IsType<PostgreSqlDatabaseProvider>(provider.GetRequiredService<IJellyfinDatabaseProvider>());
+    }
+
+    [Theory]
+    [InlineData(DatabaseLockingBehaviorTypes.Pessimistic)]
+    [InlineData(DatabaseLockingBehaviorTypes.Optimistic)]
+    public void AddJellyfinDbContext_PostgreSqlRejectsSqliteLockingBehaviors(DatabaseLockingBehaviorTypes lockingBehavior)
+    {
+        var configuration = new DatabaseConfigurationOptions
+        {
+            DatabaseType = DatabaseProviderKey.PostgreSql,
+            LockingBehavior = lockingBehavior,
+            CustomProviderOptions = new CustomDatabaseOptions
+            {
+                PluginName = string.Empty,
+                PluginAssembly = string.Empty,
+                ConnectionString = "Host=db;Database=jellyfin"
+            }
+        };
+
+        var exception = Assert.Throws<InvalidOperationException>(() => CreateServices(configuration));
+
+        Assert.Contains(DatabaseProviderKey.PostgreSql, exception.Message, StringComparison.Ordinal);
+        Assert.Contains(nameof(DatabaseLockingBehaviorTypes.NoLock), exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AddJellyfinDbContext_PostgreSqlDefaultsToNoApplicationLock()
+    {
+        var configuration = new DatabaseConfigurationOptions
+        {
+            DatabaseType = DatabaseProviderKey.PostgreSql,
+            CustomProviderOptions = new CustomDatabaseOptions
+            {
+                PluginName = string.Empty,
+                PluginAssembly = string.Empty,
+                ConnectionString = "Host=db;Database=jellyfin"
+            }
+        };
+
+        using var provider = CreateServices(configuration).BuildServiceProvider();
+
+        Assert.IsType<NoLockBehavior>(provider.GetRequiredService<IEntityFrameworkCoreLockingBehavior>());
     }
 
     [Fact]

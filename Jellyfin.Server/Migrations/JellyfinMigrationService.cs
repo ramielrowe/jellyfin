@@ -110,6 +110,13 @@ internal class JellyfinMigrationService
                     ?? throw new InvalidOperationException("Jellyfin does only support relational databases.");
                 if (!await databaseCreator.ExistsAsync().ConfigureAwait(false))
                 {
+                    if (string.Equals(_jellyfinDatabaseProvider?.ProviderKey, DatabaseProviderKey.PostgreSql, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException(
+                            $"The PostgreSQL database does not exist. Create the configured database and grant ownership to the Jellyfin database user before starting Jellyfin; "
+                            + "Jellyfin does not require or use PostgreSQL CREATEDB or administrator privileges.");
+                    }
+
                     await databaseCreator.CreateAsync().ConfigureAwait(false);
                 }
 
@@ -472,9 +479,15 @@ internal class JellyfinMigrationService
             var historyRepository = dbContext.GetService<IHistoryRepository>();
             var migrationsAssembly = dbContext.GetService<IMigrationsAssembly>();
             appliedMigrations = await historyRepository.GetAppliedMigrationsAsync().ConfigureAwait(false);
+            var appliedMigrationIds = appliedMigrations.Select(migration => migration.MigrationId).ToHashSet(StringComparer.Ordinal);
+            var providerMigrationIds = migrationsAssembly.Migrations.Keys.ToArray();
             backupInstruction = new JellyfinMigrationBackupAttribute()
             {
-                JellyfinDb = migrationsAssembly.Migrations.Any(f => appliedMigrations.All(e => e.MigrationId != f.Key))
+                // A first run applies the provider's baseline to an empty, pre-created database. There is no
+                // existing database state to protect and PostgreSQL deliberately runs without backup/admin
+                // privileges. Once any provider migration has been applied, retain the normal pre-upgrade backup.
+                JellyfinDb = providerMigrationIds.Any(appliedMigrationIds.Contains)
+                    && providerMigrationIds.Any(migrationId => !appliedMigrationIds.Contains(migrationId))
             };
         }
 

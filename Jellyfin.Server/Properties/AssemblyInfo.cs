@@ -22,3 +22,4 @@ using System.Runtime.InteropServices;
 [assembly: ComVisible(false)]
 
 [assembly: InternalsVisibleTo("Jellyfin.Server.Tests")]
+[assembly: InternalsVisibleTo("Jellyfin.Server.Implementations.Tests")]
