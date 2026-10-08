@@ -40,7 +40,8 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
 
     public static async Task<PostgreSqlTestDatabase> CreateAsync(
         string administratorConnectionString,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<string>? databaseCreated = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -61,6 +62,9 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
                 command.CommandText = "CREATE DATABASE " + QuoteOwnedDatabaseName(databaseName);
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
             }
+
+            databaseCreated?.Invoke(databaseName);
+            cancellationToken.ThrowIfCancellationRequested();
 
             var testBuilder = new NpgsqlConnectionStringBuilder(normalizedAdministratorConnectionString)
             {
@@ -85,30 +89,18 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            if (testDataSource is not null)
+            if (!await CleanupFailedCreationAsync(testDataSource, administratorDataSource, databaseName).ConfigureAwait(false))
             {
-                await testDataSource.DisposeAsync().ConfigureAwait(false);
-            }
-
-            if (administratorDataSource is not null)
-            {
-                await TryDropOwnedDatabaseAsync(administratorDataSource, databaseName).ConfigureAwait(false);
-                await administratorDataSource.DisposeAsync().ConfigureAwait(false);
+                throw CreateCleanupFailureException(databaseName);
             }
 
             throw;
         }
         catch (NpgsqlException)
         {
-            if (testDataSource is not null)
+            if (!await CleanupFailedCreationAsync(testDataSource, administratorDataSource, databaseName).ConfigureAwait(false))
             {
-                await testDataSource.DisposeAsync().ConfigureAwait(false);
-            }
-
-            if (administratorDataSource is not null)
-            {
-                await TryDropOwnedDatabaseAsync(administratorDataSource, databaseName).ConfigureAwait(false);
-                await administratorDataSource.DisposeAsync().ConfigureAwait(false);
+                throw CreateCleanupFailureException(databaseName);
             }
 
             throw new InvalidOperationException(
@@ -150,8 +142,24 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         _ = QuoteOwnedDatabaseName(DatabaseName);
 
         await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await EnsureConnectedToOwnedDatabaseAsync(connection, cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
-        command.CommandText = "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public";
+        command.CommandText = """
+            DO $reset$
+            DECLARE schema_name text;
+            BEGIN
+                FOR schema_name IN
+                    SELECT nspname
+                    FROM pg_namespace
+                    WHERE nspname <> 'information_schema'
+                        AND nspname !~ '^pg_'
+                LOOP
+                    EXECUTE format('DROP SCHEMA %I CASCADE', schema_name);
+                END LOOP;
+            END
+            $reset$;
+            CREATE SCHEMA public;
+            """;
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -174,6 +182,16 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         return (bool)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
     }
 
+    public async Task<bool> SchemaExistsAsync(string schemaName, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await using var connection = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT EXISTS (SELECT FROM pg_namespace WHERE nspname = $1)";
+        command.Parameters.AddWithValue(schemaName);
+        return (bool)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+    }
+
     public static string CreateDatabaseName()
         => DatabaseNamePrefix + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
 
@@ -186,7 +204,16 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         var builder = new NpgsqlConnectionStringBuilder(connectionString);
         _ = builder.Remove("Password");
         _ = builder.Remove("Passfile");
+        _ = builder.Remove("SSL Password");
         return builder.ConnectionString;
+    }
+
+    internal static InvalidOperationException CreateCleanupFailureException(string databaseName)
+    {
+        _ = QuoteOwnedDatabaseName(databaseName);
+        return new InvalidOperationException(
+            $"Unable to remove isolated PostgreSQL test database '{databaseName}' after test setup failed. "
+            + "Remove that database manually before rerunning the tests.");
     }
 
     public static NpgsqlConnectionStringBuilder ValidateAdministratorConnectionString(string connectionString)
@@ -280,15 +307,50 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task TryDropOwnedDatabaseAsync(NpgsqlDataSource administratorDataSource, string databaseName)
+    private async Task EnsureConnectedToOwnedDatabaseAsync(
+        NpgsqlConnection connection,
+        CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT current_database()";
+        var currentDatabase = (string)(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false))!;
+        if (!IsOwnedDatabaseName(currentDatabase)
+            || !string.Equals(currentDatabase, DatabaseName, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("Refusing to reset a database not created by this PostgreSQL test fixture.");
+        }
+    }
+
+    private static async Task<bool> CleanupFailedCreationAsync(
+        NpgsqlDataSource? testDataSource,
+        NpgsqlDataSource? administratorDataSource,
+        string databaseName)
+    {
+        if (testDataSource is not null)
+        {
+            await testDataSource.DisposeAsync().ConfigureAwait(false);
+        }
+
+        if (administratorDataSource is null)
+        {
+            return true;
+        }
+
+        var cleanupSucceeded = await TryDropOwnedDatabaseAsync(administratorDataSource, databaseName).ConfigureAwait(false);
+        await administratorDataSource.DisposeAsync().ConfigureAwait(false);
+        return cleanupSucceeded;
+    }
+
+    private static async Task<bool> TryDropOwnedDatabaseAsync(NpgsqlDataSource administratorDataSource, string databaseName)
     {
         try
         {
             await DropOwnedDatabaseAsync(administratorDataSource, databaseName, CancellationToken.None).ConfigureAwait(false);
+            return true;
         }
         catch (NpgsqlException)
         {
-            // Preserve the original startup or cancellation failure. The generated name is safe to report for manual cleanup.
+            return false;
         }
     }
 }

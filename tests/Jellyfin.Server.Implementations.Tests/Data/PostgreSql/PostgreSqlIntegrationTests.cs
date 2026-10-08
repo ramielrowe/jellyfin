@@ -40,23 +40,38 @@ public sealed class PostgreSqlIntegrationTests
         var database = await _fixture.GetDatabaseAsync(cancellationToken).ConfigureAwait(true);
         await database.ResetAsync(cancellationToken).ConfigureAwait(true);
         await database.ExecuteNonQueryAsync("CREATE TABLE fixture_reset_probe (id integer PRIMARY KEY)", cancellationToken).ConfigureAwait(true);
+        await database.ExecuteNonQueryAsync(
+            "CREATE SCHEMA fixture_private; CREATE TABLE fixture_private.fixture_reset_probe (id integer PRIMARY KEY)",
+            cancellationToken).ConfigureAwait(true);
 
         Assert.True(await database.TableExistsAsync("fixture_reset_probe", cancellationToken).ConfigureAwait(true));
+        Assert.True(await database.SchemaExistsAsync("fixture_private", cancellationToken).ConfigureAwait(true));
 
         await database.ResetAsync(cancellationToken).ConfigureAwait(true);
 
         Assert.False(await database.TableExistsAsync("fixture_reset_probe", cancellationToken).ConfigureAwait(true));
+        Assert.False(await database.SchemaExistsAsync("fixture_private", cancellationToken).ConfigureAwait(true));
     }
 
     [Fact]
-    public async Task CreateAsync_ObservesCancellation()
+    public async Task CreateAsync_CancellationAfterDatabaseCreationDropsDatabase()
     {
         SkipUnlessConfigured();
         using var cancellationTokenSource = new CancellationTokenSource();
-        await cancellationTokenSource.CancelAsync().ConfigureAwait(true);
+        string? databaseName = null;
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => _fixture.CreateIsolatedDatabaseAsync(cancellationTokenSource.Token)).ConfigureAwait(true);
+            () => _fixture.CreateIsolatedDatabaseAsync(
+                cancellationTokenSource.Token,
+                createdDatabaseName =>
+                {
+                    databaseName = createdDatabaseName;
+                    cancellationTokenSource.Cancel();
+                })).ConfigureAwait(true);
+
+        Assert.NotNull(databaseName);
+        Assert.True(PostgreSqlTestDatabase.IsOwnedDatabaseName(databaseName));
+        Assert.False(await _fixture.DatabaseExistsAsync(databaseName, TestContext.Current.CancellationToken).ConfigureAwait(true));
     }
 
     [Fact]
