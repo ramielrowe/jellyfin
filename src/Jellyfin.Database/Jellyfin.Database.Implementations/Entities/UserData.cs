@@ -1,4 +1,6 @@
 using System;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Jellyfin.Database.Implementations.Entities;
 
@@ -7,11 +9,26 @@ namespace Jellyfin.Database.Implementations.Entities;
 /// </summary>
 public class UserData
 {
+    private string _customDataKey = null!;
+
     /// <summary>
     /// Gets or sets the custom data key.
     /// </summary>
     /// <value>The rating.</value>
-    public required string CustomDataKey { get; set; }
+    public required string CustomDataKey
+    {
+        get => _customDataKey;
+        set
+        {
+            _customDataKey = value;
+            CustomDataKeyDigest = SHA256.HashData(Encoding.UTF8.GetBytes(value));
+        }
+    }
+
+    /// <summary>
+    /// Gets the fixed-size UTF-8 digest used as the PostgreSQL key for an unbounded custom data key.
+    /// </summary>
+    public byte[] CustomDataKeyDigest { get; private set; } = null!;
 
     /// <summary>
     /// Gets or sets the users 0-10 rating.

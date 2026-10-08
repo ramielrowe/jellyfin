@@ -1,4 +1,6 @@
 using System;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace Jellyfin.Database.Implementations.Entities;
 
@@ -7,6 +9,8 @@ namespace Jellyfin.Database.Implementations.Entities;
 /// </summary>
 public class PeopleBaseItemMap
 {
+    private string? _role;
+
     /// <summary>
     /// Gets or Sets the SortOrder.
     /// </summary>
@@ -20,7 +24,20 @@ public class PeopleBaseItemMap
     /// <summary>
     /// Gets or Sets the Role name the associated actor played in the <see cref="BaseItemEntity"/>.
     /// </summary>
-    public string? Role { get; set; }
+    public string? Role
+    {
+        get => _role;
+        set
+        {
+            _role = value;
+            RoleDigest = value is null ? null! : SHA256.HashData(Encoding.UTF8.GetBytes(value));
+        }
+    }
+
+    /// <summary>
+    /// Gets the fixed-size UTF-8 digest used as the PostgreSQL key for an unbounded role.
+    /// </summary>
+    public byte[] RoleDigest { get; private set; } = null!;
 
     /// <summary>
     /// Gets or Sets The ItemId.

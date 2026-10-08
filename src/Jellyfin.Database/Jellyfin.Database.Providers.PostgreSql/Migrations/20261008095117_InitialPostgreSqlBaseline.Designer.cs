@@ -12,7 +12,7 @@ using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 namespace Jellyfin.Database.Providers.PostgreSql.Migrations
 {
     [DbContext(typeof(JellyfinDbContext))]
-    [Migration("20261008092257_InitialPostgreSqlBaseline")]
+    [Migration("20261008095117_InitialPostgreSqlBaseline")]
     partial class InitialPostgreSqlBaseline
     {
         /// <inheritdoc />
@@ -519,6 +519,7 @@ namespace Jellyfin.Database.Providers.PostgreSql.Migrations
                         .HasColumnType("bytea");
 
                     b.Property<string>("ProviderId")
+                        .IsRequired()
                         .HasColumnType("text");
 
                     b.Property<string>("ProviderValue")
@@ -1083,16 +1084,20 @@ namespace Jellyfin.Database.Providers.PostgreSql.Migrations
                     b.Property<Guid>("PeopleId")
                         .HasColumnType("uuid");
 
-                    b.Property<string>("Role")
-                        .HasColumnType("text");
+                    b.Property<byte[]>("RoleDigest")
+                        .HasColumnType("bytea");
 
                     b.Property<int?>("ListOrder")
                         .HasColumnType("integer");
 
+                    b.Property<string>("Role")
+                        .IsRequired()
+                        .HasColumnType("text");
+
                     b.Property<int?>("SortOrder")
                         .HasColumnType("integer");
 
-                    b.HasKey("ItemId", "PeopleId", "Role");
+                    b.HasKey("ItemId", "PeopleId", "RoleDigest");
 
                     b.HasIndex("ItemId", "ListOrder");
 
@@ -1442,11 +1447,15 @@ namespace Jellyfin.Database.Providers.PostgreSql.Migrations
                     b.Property<Guid>("UserId")
                         .HasColumnType("uuid");
 
-                    b.Property<string>("CustomDataKey")
-                        .HasColumnType("text");
+                    b.Property<byte[]>("CustomDataKeyDigest")
+                        .HasColumnType("bytea");
 
                     b.Property<int?>("AudioStreamIndex")
                         .HasColumnType("integer");
+
+                    b.Property<string>("CustomDataKey")
+                        .IsRequired()
+                        .HasColumnType("text");
 
                     b.Property<bool>("IsFavorite")
                         .HasColumnType("boolean");
@@ -1475,7 +1484,7 @@ namespace Jellyfin.Database.Providers.PostgreSql.Migrations
                     b.Property<int?>("SubtitleStreamIndex")
                         .HasColumnType("integer");
 
-                    b.HasKey("ItemId", "UserId", "CustomDataKey");
+                    b.HasKey("ItemId", "UserId", "CustomDataKeyDigest");
 
                     b.HasIndex("ItemId", "UserId", "IsFavorite");
 

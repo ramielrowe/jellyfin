@@ -374,7 +374,7 @@ namespace Jellyfin.Database.Providers.PostgreSql.Migrations
                 {
                     ItemId = table.Column<Guid>(type: "uuid", nullable: false),
                     ProviderIdDigest = table.Column<byte[]>(type: "bytea", nullable: false),
-                    ProviderId = table.Column<string>(type: "text", nullable: true),
+                    ProviderId = table.Column<string>(type: "text", nullable: false),
                     ProviderValue = table.Column<string>(type: "text", nullable: false)
                 },
                 constraints: table =>
@@ -563,15 +563,16 @@ namespace Jellyfin.Database.Providers.PostgreSql.Migrations
                 name: "PeopleBaseItemMap",
                 columns: table => new
                 {
-                    Role = table.Column<string>(type: "text", nullable: false),
+                    RoleDigest = table.Column<byte[]>(type: "bytea", nullable: false),
                     ItemId = table.Column<Guid>(type: "uuid", nullable: false),
                     PeopleId = table.Column<Guid>(type: "uuid", nullable: false),
                     SortOrder = table.Column<int>(type: "integer", nullable: true),
-                    ListOrder = table.Column<int>(type: "integer", nullable: true)
+                    ListOrder = table.Column<int>(type: "integer", nullable: true),
+                    Role = table.Column<string>(type: "text", nullable: false)
                 },
                 constraints: table =>
                 {
-                    table.PrimaryKey("PK_PeopleBaseItemMap", x => new { x.ItemId, x.PeopleId, x.Role });
+                    table.PrimaryKey("PK_PeopleBaseItemMap", x => new { x.ItemId, x.PeopleId, x.RoleDigest });
                     table.ForeignKey(
                         name: "FK_PeopleBaseItemMap_BaseItems_ItemId",
                         column: x => x.ItemId,
@@ -763,9 +764,10 @@ namespace Jellyfin.Database.Providers.PostgreSql.Migrations
                 name: "UserData",
                 columns: table => new
                 {
-                    CustomDataKey = table.Column<string>(type: "text", nullable: false),
+                    CustomDataKeyDigest = table.Column<byte[]>(type: "bytea", nullable: false),
                     ItemId = table.Column<Guid>(type: "uuid", nullable: false),
                     UserId = table.Column<Guid>(type: "uuid", nullable: false),
+                    CustomDataKey = table.Column<string>(type: "text", nullable: false),
                     Rating = table.Column<double>(type: "double precision", nullable: true),
                     PlaybackPositionTicks = table.Column<long>(type: "bigint", nullable: false),
                     PlayCount = table.Column<int>(type: "integer", nullable: false),
@@ -779,7 +781,7 @@ namespace Jellyfin.Database.Providers.PostgreSql.Migrations
                 },
                 constraints: table =>
                 {
-                    table.PrimaryKey("PK_UserData", x => new { x.ItemId, x.UserId, x.CustomDataKey });
+                    table.PrimaryKey("PK_UserData", x => new { x.ItemId, x.UserId, x.CustomDataKeyDigest });
                     table.ForeignKey(
                         name: "FK_UserData_BaseItems_ItemId",
                         column: x => x.ItemId,

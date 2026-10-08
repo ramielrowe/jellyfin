@@ -1,5 +1,7 @@
 using System;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using Emby.Server.Implementations.Data;
 using Jellyfin.Data.Enums;
 using Jellyfin.Database.Implementations.Entities;
@@ -187,6 +189,132 @@ public sealed class BaseItemRepositoryProviderParityTests : SqliteDbTestFixture
             ProviderValue = "duplicate"
         });
         Assert.Throws<DbUpdateException>(() => duplicateContext.SaveChanges());
+    }
+
+    [Fact]
+    public void CompositeTextKeys_RemainUnboundedAndUseOriginalTextOnSqlite()
+    {
+        var itemId = Guid.NewGuid();
+        var peopleId = Guid.NewGuid();
+        var rolePrefix = new string('r', 4_000);
+        var role = rolePrefix + "-first";
+        var distinctRole = rolePrefix + "-second";
+        var keyPrefix = new string('k', 12_000);
+        var customDataKey = keyPrefix + "-first";
+        var distinctCustomDataKey = keyPrefix + "-second";
+        Guid userId;
+        using (var context = CreateDbContext())
+        {
+            var item = CreateItem(itemId, "Composite key item", "composite key item", "Composite key item");
+            var person = new People { Id = peopleId, Name = "Long Role", PersonType = "Actor" };
+            var user = new User("long-key-user", "test-auth", "test-reset");
+            userId = user.Id;
+            context.BaseItems.Add(item);
+            context.Peoples.Add(person);
+            context.Users.Add(user);
+            context.PeopleBaseItemMap.AddRange(
+                new PeopleBaseItemMap
+                {
+                    ItemId = itemId,
+                    Item = item,
+                    PeopleId = peopleId,
+                    People = person,
+                    Role = role,
+                    SortOrder = 1
+                },
+                new PeopleBaseItemMap
+                {
+                    ItemId = itemId,
+                    Item = item,
+                    PeopleId = peopleId,
+                    People = person,
+                    Role = distinctRole,
+                    SortOrder = 10
+                });
+            context.UserData.AddRange(
+                new UserData
+                {
+                    ItemId = itemId,
+                    Item = item,
+                    UserId = userId,
+                    User = user,
+                    CustomDataKey = customDataKey,
+                    PlayCount = 1
+                },
+                new UserData
+                {
+                    ItemId = itemId,
+                    Item = item,
+                    UserId = userId,
+                    User = user,
+                    CustomDataKey = distinctCustomDataKey,
+                    PlayCount = 10
+                });
+
+            context.SaveChanges();
+        }
+
+        using (var verificationContext = CreateDbContext())
+        {
+            Assert.Null(verificationContext.Model.FindEntityType(typeof(PeopleBaseItemMap))!.FindProperty(nameof(PeopleBaseItemMap.RoleDigest)));
+            Assert.Null(verificationContext.Model.FindEntityType(typeof(UserData))!.FindProperty(nameof(UserData.CustomDataKeyDigest)));
+
+            var storedMap = Assert.Single(verificationContext.PeopleBaseItemMap.Where(map => map.Role == role));
+            var storedUserData = Assert.Single(verificationContext.UserData.Where(data => data.CustomDataKey == customDataKey));
+            Assert.Equal(SHA256.HashData(Encoding.UTF8.GetBytes(role)), storedMap.RoleDigest);
+            Assert.Equal(SHA256.HashData(Encoding.UTF8.GetBytes(customDataKey)), storedUserData.CustomDataKeyDigest);
+            Assert.Equal(2, verificationContext.PeopleBaseItemMap.Count());
+            Assert.Equal(2, verificationContext.UserData.Count(data => data.UserId.Equals(userId)));
+
+            storedMap.SortOrder = 2;
+            storedUserData.PlayCount = 2;
+            verificationContext.SaveChanges();
+        }
+
+        using (var duplicateMapContext = CreateDbContext())
+        {
+            duplicateMapContext.PeopleBaseItemMap.Add(new PeopleBaseItemMap
+            {
+                ItemId = itemId,
+                Item = null!,
+                PeopleId = peopleId,
+                People = null!,
+                Role = role
+            });
+            Assert.Throws<DbUpdateException>(() => duplicateMapContext.SaveChanges());
+        }
+
+        using (var duplicateUserDataContext = CreateDbContext())
+        {
+            duplicateUserDataContext.UserData.Add(new UserData
+            {
+                ItemId = itemId,
+                Item = null!,
+                UserId = userId,
+                User = null!,
+                CustomDataKey = customDataKey
+            });
+            Assert.Throws<DbUpdateException>(() => duplicateUserDataContext.SaveChanges());
+        }
+
+        using (var context = CreateDbContext())
+        {
+            var storedMap = Assert.Single(context.PeopleBaseItemMap.Where(map => map.Role == role));
+            var storedUserData = Assert.Single(context.UserData.Where(data => data.CustomDataKey == customDataKey));
+            Assert.Equal(2, storedMap.SortOrder);
+            Assert.Equal(2, storedUserData.PlayCount);
+            context.PeopleBaseItemMap.Remove(storedMap);
+            context.UserData.Remove(storedUserData);
+            context.SaveChanges();
+        }
+
+        using (var context = CreateDbContext())
+        {
+            Assert.Empty(context.PeopleBaseItemMap.Where(map => map.Role == role));
+            Assert.Single(context.PeopleBaseItemMap.Where(map => map.Role == distinctRole));
+            Assert.Empty(context.UserData.Where(data => data.CustomDataKey == customDataKey));
+            Assert.Single(context.UserData.Where(data => data.CustomDataKey == distinctCustomDataKey));
+        }
     }
 
     private void Seed(params BaseItemEntity[] items)

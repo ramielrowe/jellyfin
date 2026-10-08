@@ -129,6 +129,23 @@ public sealed class PostgreSqlModelCompatibilityTests
         Assert.Equal(
             new[] { nameof(BaseItemProvider.ItemId), nameof(BaseItemProvider.ProviderIdDigest) },
             providers.FindPrimaryKey()!.Properties.Select(property => property.Name));
+        Assert.False(providers.FindProperty(nameof(BaseItemProvider.ProviderId))!.IsNullable);
+
+        var peopleMap = AssertEntityType<PeopleBaseItemMap>(model);
+        Assert.Equal(
+            new[] { nameof(PeopleBaseItemMap.ItemId), nameof(PeopleBaseItemMap.PeopleId), nameof(PeopleBaseItemMap.RoleDigest) },
+            peopleMap.FindPrimaryKey()!.Properties.Select(property => property.Name));
+        Assert.Null(peopleMap.FindProperty(nameof(PeopleBaseItemMap.Role))!.GetMaxLength());
+        Assert.False(peopleMap.FindProperty(nameof(PeopleBaseItemMap.Role))!.IsNullable);
+        Assert.Null(peopleMap.FindProperty(nameof(PeopleBaseItemMap.RoleDigest))!.GetComputedColumnSql());
+
+        var userData = AssertEntityType<UserData>(model);
+        Assert.Equal(
+            new[] { nameof(UserData.ItemId), nameof(UserData.UserId), nameof(UserData.CustomDataKeyDigest) },
+            userData.FindPrimaryKey()!.Properties.Select(property => property.Name));
+        Assert.Null(userData.FindProperty(nameof(UserData.CustomDataKey))!.GetMaxLength());
+        Assert.False(userData.FindProperty(nameof(UserData.CustomDataKey))!.IsNullable);
+        Assert.Null(userData.FindProperty(nameof(UserData.CustomDataKeyDigest))!.GetComputedColumnSql());
 
         var itemValues = AssertEntityType<ItemValue>(model);
         AssertIndex(itemValues, null, nameof(ItemValue.Type));

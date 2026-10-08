@@ -15,6 +15,7 @@ public class BaseItemProviderConfiguration : IEntityTypeConfiguration<BaseItemPr
         // PostgreSQL maps the digest explicitly so its primary key can remain safe for arbitrary
         // provider identifiers. SQLite retains its existing schema and key.
         builder.Ignore(e => e.ProviderIdDigest);
+        builder.Property(e => e.ProviderId).IsRequired();
         builder.HasKey(e => new { e.ItemId, e.ProviderId });
         builder.HasOne(e => e.Item);
         builder.HasIndex(e => new { e.ProviderId, e.ItemId, e.ProviderValue });

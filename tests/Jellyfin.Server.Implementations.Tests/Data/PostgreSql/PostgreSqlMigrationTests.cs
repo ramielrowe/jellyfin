@@ -1,5 +1,8 @@
 using System;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Providers.PostgreSql.Migrations;
@@ -183,6 +186,37 @@ public sealed class PostgreSqlMigrationTests
                     AND constraint_record.contype = 'p'
                 """,
                 cancellationToken).ConfigureAwait(true));
+        Assert.Equal(
+            "ItemId,PeopleId,RoleDigest",
+            await GetPrimaryKeyColumnsAsync(database, "PeopleBaseItemMap", cancellationToken).ConfigureAwait(true));
+        Assert.Equal(
+            "ItemId,UserId,CustomDataKeyDigest",
+            await GetPrimaryKeyColumnsAsync(database, "UserData", cancellationToken).ConfigureAwait(true));
+        Assert.Equal(
+            "NO",
+            await database.ExecuteScalarAsync<string>(
+                "SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'BaseItemProviders' AND column_name = 'ProviderId'",
+                cancellationToken).ConfigureAwait(true));
+        Assert.Equal(
+            "NO",
+            await database.ExecuteScalarAsync<string>(
+                "SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'PeopleBaseItemMap' AND column_name = 'Role'",
+                cancellationToken).ConfigureAwait(true));
+        Assert.Equal(
+            "NO",
+            await database.ExecuteScalarAsync<string>(
+                "SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'UserData' AND column_name = 'CustomDataKey'",
+                cancellationToken).ConfigureAwait(true));
+        Assert.Equal(
+            "bytea",
+            await database.ExecuteScalarAsync<string>(
+                "SELECT data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'PeopleBaseItemMap' AND column_name = 'RoleDigest'",
+                cancellationToken).ConfigureAwait(true));
+        Assert.Equal(
+            "bytea",
+            await database.ExecuteScalarAsync<string>(
+                "SELECT data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'UserData' AND column_name = 'CustomDataKeyDigest'",
+                cancellationToken).ConfigureAwait(true));
         Assert.Contains(
             "UNIQUE",
             await database.ExecuteScalarAsync<string>(
@@ -264,4 +298,162 @@ public sealed class PostgreSqlMigrationTests
             Assert.False(await context.BaseItems.AnyAsync(item => item.Id.Equals(childId), cancellationToken).ConfigureAwait(true));
         }
     }
+
+    [Fact]
+    public async Task Baseline_UnboundedCompositeTextKeysSupportExactCrudAndUniqueness()
+    {
+        Assert.SkipUnless(_fixture.IsConfigured, _fixture.SkipReason);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var database = await _fixture.GetDatabaseAsync(cancellationToken).ConfigureAwait(true);
+        await database.ResetAsync(cancellationToken).ConfigureAwait(true);
+
+        var itemId = Guid.NewGuid();
+        var peopleId = Guid.NewGuid();
+        var rolePrefix = new string('r', 4_000);
+        var role = rolePrefix + "-first";
+        var distinctRole = rolePrefix + "-second";
+        var keyPrefix = new string('k', 12_000);
+        var customDataKey = keyPrefix + "-first";
+        var distinctCustomDataKey = keyPrefix + "-second";
+        Guid userId;
+
+        await using (var context = database.CreateDbContext())
+        {
+            await context.Database.MigrateAsync(cancellationToken).ConfigureAwait(true);
+            var item = new BaseItemEntity { Id = itemId, Type = "Movie" };
+            var person = new People { Id = peopleId, Name = "Long Role", PersonType = "Actor" };
+            var user = new User("long-composite-keys", "test-auth", "test-reset");
+            userId = user.Id;
+            var firstMap = new PeopleBaseItemMap
+            {
+                ItemId = itemId,
+                Item = item,
+                PeopleId = peopleId,
+                People = person,
+                Role = "temporary",
+                SortOrder = 1
+            };
+            firstMap.Role = role;
+            var firstUserData = new UserData
+            {
+                ItemId = itemId,
+                Item = item,
+                UserId = userId,
+                User = user,
+                CustomDataKey = "temporary",
+                PlayCount = 1
+            };
+            firstUserData.CustomDataKey = customDataKey;
+
+            context.BaseItems.Add(item);
+            context.Peoples.Add(person);
+            context.Users.Add(user);
+            context.PeopleBaseItemMap.AddRange(
+                firstMap,
+                new PeopleBaseItemMap
+                {
+                    ItemId = itemId,
+                    Item = item,
+                    PeopleId = peopleId,
+                    People = person,
+                    Role = distinctRole,
+                    SortOrder = 10
+                });
+            context.UserData.AddRange(
+                firstUserData,
+                new UserData
+                {
+                    ItemId = itemId,
+                    Item = item,
+                    UserId = userId,
+                    User = user,
+                    CustomDataKey = distinctCustomDataKey,
+                    PlayCount = 10
+                });
+
+            await context.SaveChangesAsync(cancellationToken).ConfigureAwait(true);
+        }
+
+        await using (var context = database.CreateDbContext())
+        {
+            var storedMap = await context.PeopleBaseItemMap.SingleAsync(map => map.Role == role, cancellationToken).ConfigureAwait(true);
+            var storedUserData = await context.UserData.SingleAsync(data => data.CustomDataKey == customDataKey, cancellationToken).ConfigureAwait(true);
+            Assert.Equal(role, storedMap.Role);
+            Assert.Equal(SHA256.HashData(Encoding.UTF8.GetBytes(role)), storedMap.RoleDigest);
+            Assert.Equal(customDataKey, storedUserData.CustomDataKey);
+            Assert.Equal(SHA256.HashData(Encoding.UTF8.GetBytes(customDataKey)), storedUserData.CustomDataKeyDigest);
+            Assert.Equal(2, await context.PeopleBaseItemMap.CountAsync(cancellationToken).ConfigureAwait(true));
+            Assert.Equal(2, await context.UserData.CountAsync(data => data.UserId.Equals(userId), cancellationToken).ConfigureAwait(true));
+
+            storedMap.SortOrder = 2;
+            storedUserData.PlayCount = 2;
+            await context.SaveChangesAsync(cancellationToken).ConfigureAwait(true);
+        }
+
+        await using (var duplicateMapContext = database.CreateDbContext())
+        {
+            duplicateMapContext.PeopleBaseItemMap.Add(new PeopleBaseItemMap
+            {
+                ItemId = itemId,
+                Item = null!,
+                PeopleId = peopleId,
+                People = null!,
+                Role = role
+            });
+            await Assert.ThrowsAsync<DbUpdateException>(
+                () => duplicateMapContext.SaveChangesAsync(cancellationToken)).ConfigureAwait(true);
+        }
+
+        await using (var duplicateUserDataContext = database.CreateDbContext())
+        {
+            duplicateUserDataContext.UserData.Add(new UserData
+            {
+                ItemId = itemId,
+                Item = null!,
+                UserId = userId,
+                User = null!,
+                CustomDataKey = customDataKey
+            });
+            await Assert.ThrowsAsync<DbUpdateException>(
+                () => duplicateUserDataContext.SaveChangesAsync(cancellationToken)).ConfigureAwait(true);
+        }
+
+        await using (var context = database.CreateDbContext())
+        {
+            var storedMap = await context.PeopleBaseItemMap.SingleAsync(map => map.Role == role, cancellationToken).ConfigureAwait(true);
+            var storedUserData = await context.UserData.SingleAsync(data => data.CustomDataKey == customDataKey, cancellationToken).ConfigureAwait(true);
+            Assert.Equal(2, storedMap.SortOrder);
+            Assert.Equal(2, storedUserData.PlayCount);
+            context.PeopleBaseItemMap.Remove(storedMap);
+            context.UserData.Remove(storedUserData);
+            await context.SaveChangesAsync(cancellationToken).ConfigureAwait(true);
+        }
+
+        await using (var context = database.CreateDbContext())
+        {
+            Assert.False(await context.PeopleBaseItemMap.AnyAsync(map => map.Role == role, cancellationToken).ConfigureAwait(true));
+            Assert.True(await context.PeopleBaseItemMap.AnyAsync(map => map.Role == distinctRole, cancellationToken).ConfigureAwait(true));
+            Assert.False(await context.UserData.AnyAsync(data => data.CustomDataKey == customDataKey, cancellationToken).ConfigureAwait(true));
+            Assert.True(await context.UserData.AnyAsync(data => data.CustomDataKey == distinctCustomDataKey, cancellationToken).ConfigureAwait(true));
+        }
+    }
+
+    private static Task<string> GetPrimaryKeyColumnsAsync(
+        PostgreSqlTestDatabase database,
+        string tableName,
+        CancellationToken cancellationToken)
+        => database.ExecuteScalarAsync<string>(
+            $"""
+            SELECT string_agg(attribute.attname, ',' ORDER BY array_position(constraint_record.conkey, attribute.attnum))
+            FROM pg_constraint AS constraint_record
+            JOIN pg_class AS table_record ON table_record.oid = constraint_record.conrelid
+            JOIN pg_namespace AS namespace_record ON namespace_record.oid = table_record.relnamespace
+            JOIN pg_attribute AS attribute
+                ON attribute.attrelid = table_record.oid
+                AND attribute.attnum = ANY(constraint_record.conkey)
+            WHERE namespace_record.nspname = 'public'
+                AND table_record.relname = '{tableName}'
+                AND constraint_record.contype = 'p'
+            """,
+            cancellationToken);
 }

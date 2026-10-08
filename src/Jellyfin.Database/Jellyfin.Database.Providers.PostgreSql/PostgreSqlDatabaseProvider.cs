@@ -155,6 +155,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         ConfigureMediaStreamIndexes(modelBuilder);
         ConfigureDeviceIndexes(modelBuilder);
         ConfigureProviderIdIndexes(modelBuilder);
+        ConfigureUnboundedCompositeKeys(modelBuilder);
         ConfigureItemValueIndexes(modelBuilder);
         ConfigureCustomPreferenceIndexes(modelBuilder);
 
@@ -214,6 +215,7 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         // Use their client-computed SHA-256 digest in the physical key so PostgreSQL can enforce
         // item/provider uniqueness without rejecting otherwise valid long identifiers.
         providers.HasKey(entity => new { entity.ItemId, entity.ProviderIdDigest });
+        providers.Property(entity => entity.ProviderId).IsRequired();
         providers.Property(entity => entity.ProviderIdDigest).ValueGeneratedNever();
         RemoveIndex(providers.Metadata, nameof(BaseItemProvider.ProviderId), nameof(BaseItemProvider.ItemId), nameof(BaseItemProvider.ProviderValue));
         providers.HasIndex(entity => entity.ProviderId).HasMethod("hash");
@@ -234,6 +236,22 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         // than IMMUTABLE, so the equivalent server-side generated expression is invalid DDL.
         itemValues.Property(entity => entity.ValueDigest).ValueGeneratedNever();
         itemValues.HasIndex(entity => new { entity.Type, entity.ValueDigest }).IsUnique();
+    }
+
+    private static void ConfigureUnboundedCompositeKeys(ModelBuilder modelBuilder)
+    {
+        // Roles and custom data keys are client/plugin-supplied text without a shared length limit.
+        // PostgreSQL B-trees cannot safely use arbitrary-length text as primary-key columns, so use
+        // application-computed SHA-256 digests while retaining the original text for exact queries.
+        var peopleMap = modelBuilder.Entity<PeopleBaseItemMap>();
+        peopleMap.HasKey(entity => new { entity.ItemId, entity.PeopleId, entity.RoleDigest });
+        peopleMap.Property(entity => entity.Role).IsRequired();
+        peopleMap.Property(entity => entity.RoleDigest).ValueGeneratedNever();
+
+        var userData = modelBuilder.Entity<UserData>();
+        userData.HasKey(entity => new { entity.ItemId, entity.UserId, entity.CustomDataKeyDigest });
+        userData.Property(entity => entity.CustomDataKey).IsRequired();
+        userData.Property(entity => entity.CustomDataKeyDigest).ValueGeneratedNever();
     }
 
     private static void ConfigureCustomPreferenceIndexes(ModelBuilder modelBuilder)
