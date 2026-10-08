@@ -28,10 +28,11 @@ public interface IJellyfinDatabaseProvider
     /// Gets the optional operations supported by this provider.
     /// </summary>
     /// <remarks>
-    /// The default is deliberately conservative so that a provider does not opt in to destructive operations merely
-    /// by loading. Existing providers remain binary compatible, but must explicitly advertise optional operations.
+    /// The default identifies providers compiled against the historical contract without advertising support for any
+    /// operation. New and updated providers should explicitly return <see cref="DatabaseProviderCapabilities.None"/>
+    /// or the operations they support.
     /// </remarks>
-    DatabaseProviderCapabilities Capabilities => DatabaseProviderCapabilities.None;
+    DatabaseProviderCapabilities Capabilities => DatabaseProviderCapabilities.Unknown;
 
     /// <summary>
     /// Gets or Sets the Database Factory when initialisaition is done.

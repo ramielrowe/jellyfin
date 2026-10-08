@@ -522,7 +522,8 @@ internal class JellyfinMigrationService
 
         if (backupInstruction.JellyfinDb && _jellyfinDatabaseProvider is not null)
         {
-            if (!_jellyfinDatabaseProvider.Capabilities.HasFlag(DatabaseProviderCapabilities.FastMigrationBackup))
+            if (_jellyfinDatabaseProvider.Capabilities != DatabaseProviderCapabilities.Unknown
+                && !_jellyfinDatabaseProvider.Capabilities.HasFlag(DatabaseProviderCapabilities.FastMigrationBackup))
             {
                 throw new InvalidOperationException(
                     $"Database provider '{_jellyfinDatabaseProvider.ProviderKey}' does not support the fast backup and restore operation required before pending migrations. "
@@ -530,7 +531,20 @@ internal class JellyfinMigrationService
             }
 
             logger.LogInformation("A migration will attempt to modify the jellyfin.db, will attempt to backup the file now.");
-            _backupKey = (_backupKey.LibraryDb, await _jellyfinDatabaseProvider.MigrationBackupFast(CancellationToken.None).ConfigureAwait(false), _backupKey.FullBackup);
+            string databaseBackupKey;
+            try
+            {
+                databaseBackupKey = await _jellyfinDatabaseProvider.MigrationBackupFast(CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (NotImplementedException ex) when (_jellyfinDatabaseProvider.Capabilities == DatabaseProviderCapabilities.Unknown)
+            {
+                throw new InvalidOperationException(
+                    $"Legacy database provider '{_jellyfinDatabaseProvider.ProviderKey}' does not implement the fast backup operation required before pending migrations. "
+                    + "Startup has stopped before applying migrations. Back up the database using a provider-supported procedure before upgrading.",
+                    ex);
+            }
+
+            _backupKey = (_backupKey.LibraryDb, databaseBackupKey, _backupKey.FullBackup);
             logger.LogInformation("Jellyfin database has been backed up as {BackupPath}", _backupKey.JellyfinDb);
         }
 

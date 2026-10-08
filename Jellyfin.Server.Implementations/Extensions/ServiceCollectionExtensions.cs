@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -108,6 +109,20 @@ public static class ServiceCollectionExtensions
         {
             throw new InvalidOperationException(
                 $"Database provider '{DatabaseProviderKey.PostgreSql}' requires a PostgreSQL connection string in database.xml at CustomProviderOptions.ConnectionString.");
+        }
+
+        if (efCoreConfiguration.DatabaseType.Equals(DatabaseProviderKey.PostgreSql, StringComparison.OrdinalIgnoreCase))
+        {
+            var commandTimeout = efCoreConfiguration.CustomProviderOptions?.Options.FirstOrDefault(
+                option => option.Key.Equals(PostgreSqlDatabaseProviderOptions.CommandTimeout, StringComparison.OrdinalIgnoreCase));
+            if (commandTimeout is not null
+                && (!int.TryParse(commandTimeout.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var commandTimeoutSeconds)
+                    || commandTimeoutSeconds < PostgreSqlDatabaseProviderOptions.MinimumCommandTimeoutSeconds))
+            {
+                throw new InvalidOperationException(
+                    $"Database provider '{DatabaseProviderKey.PostgreSql}' option 'CustomProviderOptions.Options[{PostgreSqlDatabaseProviderOptions.CommandTimeout}]' "
+                    + $"must be a positive whole number of seconds (minimum {PostgreSqlDatabaseProviderOptions.MinimumCommandTimeoutSeconds}).");
+            }
         }
 
         if (efCoreConfiguration.DatabaseType.Equals(DatabaseProviderKey.Plugin, StringComparison.OrdinalIgnoreCase))

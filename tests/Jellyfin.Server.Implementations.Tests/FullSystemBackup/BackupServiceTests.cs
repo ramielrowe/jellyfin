@@ -7,6 +7,7 @@ using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
+using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Locking;
 using Jellyfin.Database.Providers.Sqlite;
@@ -140,10 +141,47 @@ public sealed class BackupServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task CreateBackupAsync_WithoutDatabase_OmitsDatabaseWorkAndManifestContents()
+    {
+        var provider = CreateDatabaseProvider("Unsupported", DatabaseProviderCapabilities.None);
+
+        var manifest = await CreateBackupService(provider.Object)
+            .CreateBackupAsync(new BackupOptionsDto { Database = false })
+            .ConfigureAwait(true);
+
+        Assert.Null(manifest.DatabaseProvider);
+        Assert.False(manifest.Options.Database);
+        provider.Verify(p => p.RunScheduledOptimisation(It.IsAny<CancellationToken>()), Times.Never);
+        using var archive = await ZipFile.OpenReadAsync(manifest.Path, TestContext.Current.CancellationToken).ConfigureAwait(true);
+        Assert.DoesNotContain(archive.Entries, entry => entry.FullName.StartsWith("Database/", StringComparison.Ordinal));
+        var manifestEntry = archive.GetEntry("manifest.json");
+        Assert.NotNull(manifestEntry);
+        await using var manifestStream = await manifestEntry.OpenAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        using var document = await JsonDocument.ParseAsync(manifestStream, cancellationToken: TestContext.Current.CancellationToken).ConfigureAwait(true);
+        Assert.False(document.RootElement.GetProperty("Options").GetProperty("Database").GetBoolean());
+        Assert.Equal(JsonValueKind.Null, document.RootElement.GetProperty("DatabaseProvider").ValueKind);
+        Assert.Empty(document.RootElement.GetProperty("DatabaseTables").EnumerateArray());
+    }
+
+    [Fact]
+    public async Task CreateAndRestoreBackup_WithOldStyleProvider_PreservesLogicalBackupBehavior()
+    {
+        var provider = new LegacyDatabaseProvider();
+        Assert.Equal(DatabaseProviderCapabilities.Unknown, ((IJellyfinDatabaseProvider)provider).Capabilities);
+        var backupService = CreateBackupService(provider);
+
+        var manifest = await backupService.CreateBackupAsync(new BackupOptionsDto()).ConfigureAwait(true);
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(() => backupService.RestoreBackupAsync(manifest.Path));
+
+        Assert.Equal("purge reached", exception.Message);
+        Assert.True(provider.PurgeCalled);
+    }
+
+    [Fact]
     public async Task CreateBackupAsync_WhenDatabaseBackupIsUnsupported_FailsBeforeOptimization()
     {
         var provider = CreateDatabaseProvider("Unsupported", DatabaseProviderCapabilities.None);
-        var backupService = CreateBackupService(provider);
+        var backupService = CreateBackupService(provider.Object);
 
         var exception = await Assert.ThrowsAsync<NotSupportedException>(
             () => backupService.CreateBackupAsync(new BackupOptionsDto()));
@@ -158,7 +196,7 @@ public sealed class BackupServiceTests : IDisposable
     {
         var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto()).ConfigureAwait(true);
         var provider = CreateDatabaseProvider("Jellyfin-PgSql", DatabaseProviderCapabilities.FullSystemRestore);
-        var backupService = CreateBackupService(provider);
+        var backupService = CreateBackupService(provider.Object);
 
         var exception = await Assert.ThrowsAsync<NotSupportedException>(() => backupService.RestoreBackupAsync(manifest.Path));
 
@@ -175,7 +213,7 @@ public sealed class BackupServiceTests : IDisposable
     {
         var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto()).ConfigureAwait(true);
         var provider = CreateDatabaseProvider(DatabaseProviderKey.Sqlite, DatabaseProviderCapabilities.None);
-        var backupService = CreateBackupService(provider);
+        var backupService = CreateBackupService(provider.Object);
 
         var exception = await Assert.ThrowsAsync<NotSupportedException>(() => backupService.RestoreBackupAsync(manifest.Path));
 
@@ -196,7 +234,7 @@ public sealed class BackupServiceTests : IDisposable
             .ThrowsAsync(new InvalidOperationException("purge reached"));
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-            () => CreateBackupService(provider).RestoreBackupAsync(manifest.Path));
+            () => CreateBackupService(provider.Object).RestoreBackupAsync(manifest.Path));
 
         Assert.Equal("purge reached", exception.Message);
         provider.Verify(
@@ -209,21 +247,16 @@ public sealed class BackupServiceTests : IDisposable
     {
         var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto()).ConfigureAwait(true);
         await RewriteManifest(manifest.Path, new Version(0, 2, 0), null).ConfigureAwait(true);
-        var provider = CreateDatabaseProvider("Legacy.Plugin.Provider", DatabaseProviderCapabilities.None);
+        var provider = new LegacyDatabaseProvider();
         await AddPluginDatabaseConfiguration(
             manifest.Path,
-            provider.Object.GetType().Assembly.GetName().Name!).ConfigureAwait(true);
-        provider
-            .Setup(p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()))
-            .ThrowsAsync(new InvalidOperationException("purge reached"));
+            provider.GetType().Assembly.GetName().Name! + ".dll").ConfigureAwait(true);
 
         var exception = await Assert.ThrowsAsync<InvalidOperationException>(
             () => CreateBackupService(provider).RestoreBackupAsync(manifest.Path));
 
         Assert.Equal("purge reached", exception.Message);
-        provider.Verify(
-            p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()),
-            Times.Once);
+        Assert.True(provider.PurgeCalled);
     }
 
     [Fact]
@@ -235,7 +268,7 @@ public sealed class BackupServiceTests : IDisposable
         var provider = CreateDatabaseProvider("Legacy.Plugin.Provider", DatabaseProviderCapabilities.None);
 
         var exception = await Assert.ThrowsAsync<NotSupportedException>(
-            () => CreateBackupService(provider).RestoreBackupAsync(manifest.Path));
+            () => CreateBackupService(provider.Object).RestoreBackupAsync(manifest.Path));
 
         Assert.Contains("cannot be matched safely", exception.Message, StringComparison.Ordinal);
         provider.Verify(
@@ -251,7 +284,7 @@ public sealed class BackupServiceTests : IDisposable
         var provider = CreateDatabaseProvider(DatabaseProviderKey.Sqlite, DatabaseProviderCapabilities.FullSystemRestore);
 
         var exception = await Assert.ThrowsAsync<NotSupportedException>(
-            () => CreateBackupService(provider).RestoreBackupAsync(manifest.Path));
+            () => CreateBackupService(provider.Object).RestoreBackupAsync(manifest.Path));
 
         Assert.Contains("requires backup format version 0.3.0", exception.Message, StringComparison.Ordinal);
         provider.Verify(
@@ -259,7 +292,7 @@ public sealed class BackupServiceTests : IDisposable
             Times.Never);
     }
 
-    private BackupService CreateBackupService(Mock<IJellyfinDatabaseProvider>? jellyfinDatabaseProvider = null)
+    private BackupService CreateBackupService(IJellyfinDatabaseProvider? jellyfinDatabaseProvider = null)
     {
         var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
         factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
@@ -278,7 +311,7 @@ public sealed class BackupServiceTests : IDisposable
         applicationPaths.Setup(a => a.InternalMetadataPath).Returns(Path.Combine(_testRoot, "Metadata"));
         applicationPaths.Setup(a => a.DefaultInternalMetadataPath).Returns(Path.Combine(_testRoot, "MetadataDefault"));
 
-        jellyfinDatabaseProvider ??= CreateDatabaseProvider(DatabaseProviderKey.Sqlite, DatabaseProviderCapabilities.All);
+        jellyfinDatabaseProvider ??= CreateDatabaseProvider(DatabaseProviderKey.Sqlite, DatabaseProviderCapabilities.All).Object;
 
         var applicationLifetime = new Mock<IHostApplicationLifetime>();
 
@@ -290,7 +323,7 @@ public sealed class BackupServiceTests : IDisposable
             factory.Object,
             applicationHost.Object,
             applicationPaths.Object,
-            jellyfinDatabaseProvider.Object,
+            jellyfinDatabaseProvider,
             applicationLifetime.Object,
             libraryManager.Object);
     }
@@ -381,5 +414,40 @@ public sealed class BackupServiceTests : IDisposable
             NullLogger<JellyfinDbContext>.Instance,
             new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
             new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
+    }
+
+    private sealed class LegacyDatabaseProvider : IJellyfinDatabaseProvider
+    {
+        public bool PurgeCalled { get; private set; }
+
+        public IDbContextFactory<JellyfinDbContext>? DbContextFactory { get; set; }
+
+        public void Initialise(DbContextOptionsBuilder options, DatabaseConfigurationOptions databaseConfiguration)
+        {
+        }
+
+        public void OnModelCreating(ModelBuilder modelBuilder)
+        {
+        }
+
+        public void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
+        {
+        }
+
+        public Task RunScheduledOptimisation(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task RunShutdownTask(CancellationToken cancellationToken) => Task.CompletedTask;
+
+        public Task<string> MigrationBackupFast(CancellationToken cancellationToken) => throw new NotImplementedException();
+
+        public Task RestoreBackupFast(string key, CancellationToken cancellationToken) => throw new NotImplementedException();
+
+        public Task DeleteBackup(string key) => throw new NotImplementedException();
+
+        public Task PurgeDatabase(JellyfinDbContext dbContext, System.Collections.Generic.IEnumerable<string>? tableNames)
+        {
+            PurgeCalled = true;
+            throw new InvalidOperationException("purge reached");
+        }
     }
 }

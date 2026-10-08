@@ -161,6 +161,33 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task PrepareSystemForMigration_WithOldStyleProvider_UsesLegacyFastBackup()
+    {
+        var provider = new LegacyDatabaseProvider(_paths, throwFromBackup: false);
+        Assert.Equal(DatabaseProviderCapabilities.Unknown, ((IJellyfinDatabaseProvider)provider).Capabilities);
+        var service = CreateService(provider);
+
+        await service.PrepareSystemForMigration(NullLogger<JellyfinMigrationService>.Instance);
+
+        Assert.True(provider.MigrationBackupCalled);
+    }
+
+    [Fact]
+    public async Task PrepareSystemForMigration_WithOldStyleProviderNotImplementingFastBackup_StopsSafely()
+    {
+        var provider = new LegacyDatabaseProvider(_paths, throwFromBackup: true);
+        var service = CreateService(provider);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.PrepareSystemForMigration(NullLogger<JellyfinMigrationService>.Instance));
+
+        Assert.True(provider.MigrationBackupCalled);
+        Assert.Contains(((IJellyfinDatabaseProvider)provider).ProviderKey, exception.Message, StringComparison.Ordinal);
+        Assert.Contains("does not implement the fast backup operation", exception.Message, StringComparison.Ordinal);
+        Assert.IsType<NotImplementedException>(exception.InnerException);
+    }
+
+    [Fact]
     public async Task TryRestoreJellyfinDatabaseBackup_WhenProviderSucceeds_ReturnsTrue()
     {
         var provider = new Mock<IJellyfinDatabaseProvider>();
@@ -312,5 +339,55 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
         await using var context = await CreateDbContextAsync();
         var applied = await context.Database.GetAppliedMigrationsAsync(TestContext.Current.CancellationToken);
         return applied.Order(StringComparer.Ordinal).ToArray();
+    }
+
+    private sealed class LegacyDatabaseProvider : IJellyfinDatabaseProvider
+    {
+        private readonly SqliteDatabaseProvider _inner;
+        private readonly bool _throwFromBackup;
+
+        public LegacyDatabaseProvider(IApplicationPaths applicationPaths, bool throwFromBackup)
+        {
+            _inner = new SqliteDatabaseProvider(applicationPaths, NullLogger<SqliteDatabaseProvider>.Instance);
+            _throwFromBackup = throwFromBackup;
+        }
+
+        public bool MigrationBackupCalled { get; private set; }
+
+        public IDbContextFactory<JellyfinDbContext>? DbContextFactory
+        {
+            get => _inner.DbContextFactory;
+            set => _inner.DbContextFactory = value;
+        }
+
+        public void Initialise(DbContextOptionsBuilder options, DatabaseConfigurationOptions databaseConfiguration)
+            => _inner.Initialise(options, databaseConfiguration);
+
+        public void OnModelCreating(ModelBuilder modelBuilder) => _inner.OnModelCreating(modelBuilder);
+
+        public void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
+            => _inner.ConfigureConventions(configurationBuilder);
+
+        public Task RunScheduledOptimisation(CancellationToken cancellationToken)
+            => _inner.RunScheduledOptimisation(cancellationToken);
+
+        public Task RunShutdownTask(CancellationToken cancellationToken)
+            => _inner.RunShutdownTask(cancellationToken);
+
+        public Task<string> MigrationBackupFast(CancellationToken cancellationToken)
+        {
+            MigrationBackupCalled = true;
+            return _throwFromBackup
+                ? throw new NotImplementedException()
+                : Task.FromResult("legacy-backup");
+        }
+
+        public Task RestoreBackupFast(string key, CancellationToken cancellationToken)
+            => throw new NotImplementedException();
+
+        public Task DeleteBackup(string key) => throw new NotImplementedException();
+
+        public Task PurgeDatabase(JellyfinDbContext dbContext, IEnumerable<string>? tableNames)
+            => _inner.PurgeDatabase(dbContext, tableNames);
     }
 }

@@ -29,6 +29,16 @@ public enum DatabaseProviderCapabilities
     FullSystemRestore = 1 << 2,
 
     /// <summary>
+    /// The provider predates explicit capability declarations.
+    /// </summary>
+    /// <remarks>
+    /// Consumers may preserve non-destructive legacy behavior for these providers, but must not treat this value as
+    /// an affirmative capability declaration. New and updated providers should return either <see cref="None"/> or
+    /// the operations they explicitly support.
+    /// </remarks>
+    Unknown = 1 << 3,
+
+    /// <summary>
     /// All optional operations currently defined by Jellyfin.
     /// </summary>
     All = FastMigrationBackup | FullSystemBackup | FullSystemRestore

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.ObjectModel;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Database.Providers.Sqlite;
@@ -48,6 +49,69 @@ public class ServiceCollectionExtensionsTests
         Assert.Contains(DatabaseProviderKey.PostgreSql, exception.Message, StringComparison.Ordinal);
         Assert.DoesNotContain(Secret, exception.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("correct horse battery staple", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("-1")]
+    [InlineData("not-a-number")]
+    public void AddJellyfinDbContext_PostgreSqlWithInvalidCommandTimeout_ThrowsCredentialSafeError(string commandTimeout)
+    {
+        const string Secret = "Host=db;Database=jellyfin;Username=jellyfin;Password=correct horse battery staple";
+        var configuration = new DatabaseConfigurationOptions
+        {
+            DatabaseType = DatabaseProviderKey.PostgreSql,
+            CustomProviderOptions = new CustomDatabaseOptions
+            {
+                PluginName = string.Empty,
+                PluginAssembly = string.Empty,
+                ConnectionString = Secret,
+                Options = new Collection<CustomDatabaseOption>
+                {
+                    new()
+                    {
+                        Key = PostgreSqlDatabaseProviderOptions.CommandTimeout,
+                        Value = commandTimeout
+                    }
+                }
+            }
+        };
+
+        var exception = Assert.Throws<InvalidOperationException>(() => CreateServices(configuration));
+
+        Assert.Contains(DatabaseProviderKey.PostgreSql, exception.Message, StringComparison.Ordinal);
+        Assert.Contains(PostgreSqlDatabaseProviderOptions.CommandTimeout, exception.Message, StringComparison.Ordinal);
+        Assert.Contains("positive whole number", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(Secret, exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("correct horse battery staple", exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AddJellyfinDbContext_PostgreSqlWithPositiveCommandTimeout_ContinuesToProviderLookup()
+    {
+        var configuration = new DatabaseConfigurationOptions
+        {
+            DatabaseType = DatabaseProviderKey.PostgreSql,
+            CustomProviderOptions = new CustomDatabaseOptions
+            {
+                PluginName = string.Empty,
+                PluginAssembly = string.Empty,
+                ConnectionString = "Host=db;Database=jellyfin",
+                Options = new Collection<CustomDatabaseOption>
+                {
+                    new()
+                    {
+                        Key = "COMMAND-TIMEOUT",
+                        Value = "1"
+                    }
+                }
+            }
+        };
+
+        var exception = Assert.Throws<InvalidOperationException>(() => CreateServices(configuration));
+
+        Assert.Contains("cannot find the database provider", exception.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("positive whole number", exception.Message, StringComparison.Ordinal);
     }
 
     [Theory]
