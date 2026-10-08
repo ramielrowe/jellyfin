@@ -176,6 +176,22 @@ namespace Jellyfin.Extensions
         }
 
         /// <summary>
+        /// Escapes the characters that have special meaning in a SQL <c>LIKE</c> pattern.
+        /// </summary>
+        /// <param name="value">The literal value to escape.</param>
+        /// <param name="escapeCharacter">The character used by the SQL <c>LIKE ... ESCAPE</c> clause.</param>
+        /// <returns>A value that can be embedded in a <c>LIKE</c> pattern without treating user input as a pattern.</returns>
+        public static string EscapeLikePattern(this string value, char escapeCharacter = '\\')
+        {
+            ArgumentNullException.ThrowIfNull(value);
+
+            return value
+                .Replace(escapeCharacter.ToString(), string.Concat(escapeCharacter, escapeCharacter), StringComparison.Ordinal)
+                .Replace("%", string.Concat(escapeCharacter, '%'), StringComparison.Ordinal)
+                .Replace("_", string.Concat(escapeCharacter, '_'), StringComparison.Ordinal);
+        }
+
+        /// <summary>
         /// Escapes an argument so that it survives command line parsing as a single argument when it is wrapped in double quotes by the caller.
         /// </summary>
         /// <param name="value">The argument to escape.</param>

@@ -23,7 +23,7 @@ public sealed class PeopleRepositoryNameRangeTests : SqliteDbTestFixture
     {
         using (var context = CreateDbContext())
         {
-            foreach (var name in new[] { "50 Cent", "alpha centauri", "Brad Pitt", "bob dylan", "Zoe Saldana" })
+            foreach (var name in new[] { "50 Cent", "alpha centauri", "Brad Pitt", "bob dylan", "Zoe Saldana", "éclair" })
             {
                 context.Peoples.Add(new People { Id = Guid.NewGuid(), Name = name, PersonType = "Actor" });
             }
@@ -38,7 +38,7 @@ public sealed class PeopleRepositoryNameRangeTests : SqliteDbTestFixture
     [InlineData(null, "A", new[] { "50 Cent" })]
     [InlineData(null, "C", new[] { "50 Cent", "alpha centauri", "bob dylan", "Brad Pitt" })]
     [InlineData("B", "C", new[] { "bob dylan", "Brad Pitt" })]
-    [InlineData("Y", null, new[] { "Zoe Saldana" })]
+    [InlineData("Y", null, new[] { "Zoe Saldana", "éclair" })]
     public void GetPeople_NameRange_IgnoresCase(string? nameStartsWithOrGreater, string? nameLessThan, string[] expected)
     {
         var result = _repository.GetPeople(new InternalPeopleQuery
@@ -63,5 +63,16 @@ public sealed class PeopleRepositoryNameRangeTests : SqliteDbTestFixture
 
         Assert.Equal(expected, result.Items.Select(person => person.Name));
         Assert.Equal(expected.Length, result.TotalRecordCount);
+    }
+
+    [Fact]
+    public void GetPeople_NonAsciiPrefix_HasDeterministicOrdinalBehavior()
+    {
+        var result = _repository.GetPeople(new InternalPeopleQuery
+        {
+            NameStartsWith = "é"
+        });
+
+        Assert.Equal("éclair", Assert.Single(result.Items).Name);
     }
 }

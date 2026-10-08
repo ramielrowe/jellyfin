@@ -25,8 +25,6 @@ namespace Jellyfin.Server.Implementations.Item;
 
 public sealed partial class BaseItemRepository
 {
-    private static readonly IReadOnlyList<char> SearchWildcardTerms = ['%', '_', '[', ']', '^'];
-
     private static readonly string ImdbProviderName = MetadataProvider.Imdb.ToString().ToLowerInvariant();
     private static readonly string TmdbProviderName = MetadataProvider.Tmdb.ToString().ToLowerInvariant();
     private static readonly string TvdbProviderName = MetadataProvider.Tvdb.ToString().ToLowerInvariant();
@@ -260,17 +258,15 @@ public sealed partial class BaseItemRepository
         if (!string.IsNullOrEmpty(filter.SearchTerm))
         {
             var cleanedSearchTerm = filter.SearchTerm.GetCleanValue();
-            var originalSearchTerm = filter.SearchTerm;
-            if (SearchWildcardTerms.Any(f => cleanedSearchTerm.Contains(f)))
+            var originalSearchTerm = filter.SearchTerm.ToLowerInvariant();
+            var originalPattern = $"%{originalSearchTerm.EscapeLikePattern()}%";
+            if (string.IsNullOrEmpty(cleanedSearchTerm))
             {
-                cleanedSearchTerm = $"%{cleanedSearchTerm.Trim('%')}%";
-                var likeSearchTerm = $"%{originalSearchTerm.Trim('%')}%";
-                baseQuery = baseQuery.Where(e => EF.Functions.Like(e.CleanName!, cleanedSearchTerm) || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle, likeSearchTerm)));
+                baseQuery = baseQuery.Where(e => e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle.ToLower(), originalPattern, "\\"));
             }
             else
             {
-                var likeSearchTerm = $"%{originalSearchTerm}%";
-                baseQuery = baseQuery.Where(e => e.CleanName!.Contains(cleanedSearchTerm) || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle, likeSearchTerm)));
+                baseQuery = baseQuery.Where(e => e.CleanName!.Contains(cleanedSearchTerm) || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle.ToLower(), originalPattern, "\\")));
             }
         }
 
@@ -483,17 +479,18 @@ public sealed partial class BaseItemRepository
         var nameContains = filter.NameContains;
         if (!string.IsNullOrWhiteSpace(nameContains))
         {
-            if (SearchWildcardTerms.Any(f => nameContains.Contains(f)))
+            var cleanNameContains = nameContains.GetCleanValue();
+            var originalNameContains = nameContains.ToLowerInvariant();
+            var originalPattern = $"%{originalNameContains.EscapeLikePattern()}%";
+            if (string.IsNullOrEmpty(cleanNameContains))
             {
-                nameContains = $"%{nameContains.Trim('%')}%";
-                baseQuery = baseQuery.Where(e => EF.Functions.Like(e.CleanName, nameContains) || EF.Functions.Like(e.OriginalTitle, nameContains));
+                baseQuery = baseQuery.Where(e => e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle.ToLower(), originalPattern, "\\"));
             }
             else
             {
-                var likeNameContains = $"%{nameContains}%";
                 baseQuery = baseQuery.Where(e =>
-                                    e.CleanName!.Contains(nameContains)
-                                    || EF.Functions.Like(e.OriginalTitle, likeNameContains));
+                    e.CleanName!.Contains(cleanNameContains)
+                    || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle.ToLower(), originalPattern, "\\")));
             }
         }
 

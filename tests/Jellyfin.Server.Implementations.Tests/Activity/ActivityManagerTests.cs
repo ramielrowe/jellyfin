@@ -34,4 +34,24 @@ public sealed class ActivityManagerTests : SqliteDbTestFixture
 
         Assert.Single(result.Items);
     }
+
+    [Fact]
+    public async Task GetPagedResultAsync_TextFiltersTreatLikeMetacharactersLiterally()
+    {
+        using (var context = CreateDbContext())
+        {
+            context.ActivityLogs.AddRange(
+                new ActivityLog(@"Progress C:\100%_done", "Literal", Guid.Empty),
+                new ActivityLog("Progress 100-percent done", "Literal", Guid.Empty));
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        var manager = new ActivityManager(CreateDbContextFactory());
+        var result = await manager.GetPagedResultAsync(new ActivityLogQuery
+        {
+            Name = @"C:\100%_DONE"
+        }).ConfigureAwait(true);
+
+        Assert.Equal(@"Progress C:\100%_done", Assert.Single(result.Items).Name);
+    }
 }

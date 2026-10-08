@@ -88,6 +88,49 @@ public sealed class SqlSearchProviderTests : SqliteDbTestFixture
         Assert.Equal([_primaryId], hits);
     }
 
+    [Fact]
+    public async Task SearchAsync_MixedCaseOriginalTitleAndSortName_AreScoredAsExactMatches()
+    {
+        var originalTitleId = Guid.NewGuid();
+        var sortNameId = Guid.NewGuid();
+        using (var context = CreateDbContext())
+        {
+            context.BaseItems.AddRange(
+                CreateSearchItem(originalTitleId, "Unrelated", "unrelated", "Unrelated", "THE FALL"),
+                CreateSearchItem(sortNameId, "Other", "other", "SORT SHAPE", null));
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        var originalResults = await _provider.SearchAsync(
+            new SearchProviderQuery { SearchTerm = "the fall" },
+            TestContext.Current.CancellationToken).ConfigureAwait(true);
+        var sortResults = await _provider.SearchAsync(
+            new SearchProviderQuery { SearchTerm = "sort shape" },
+            TestContext.Current.CancellationToken).ConfigureAwait(true);
+
+        Assert.Equal(100f, Assert.Single(originalResults, result => result.ItemId.Equals(originalTitleId)).Score);
+        Assert.Equal(100f, Assert.Single(sortResults, result => result.ItemId.Equals(sortNameId)).Score);
+    }
+
+    [Fact]
+    public async Task SearchAsync_LikeMetacharacters_AreLiteral()
+    {
+        var literalId = Guid.NewGuid();
+        using (var context = CreateDbContext())
+        {
+            context.BaseItems.AddRange(
+                CreateSearchItem(literalId, "Literal", "literal", "Literal", @"Rate C:\100%_DONE"),
+                CreateSearchItem(Guid.NewGuid(), "Decoy", "decoy", "Decoy", "Rate 100-percent done"));
+            await context.SaveChangesAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        }
+
+        var results = await _provider.SearchAsync(
+            new SearchProviderQuery { SearchTerm = @"C:\100%_done" },
+            TestContext.Current.CancellationToken).ConfigureAwait(true);
+
+        Assert.Equal(literalId, Assert.Single(results).ItemId);
+    }
+
     private void RestrictUserTo(params Guid[] libraryIds)
     {
         _libraryManager
@@ -130,5 +173,21 @@ public sealed class SqlSearchProviderTests : SqliteDbTestFixture
             TopParentId = libraryId,
             PresentationUniqueKey = (primaryVersionId ?? id).ToString("N"),
             PrimaryVersionId = primaryVersionId
+        };
+
+    private static BaseItemEntity CreateSearchItem(Guid id, string name, string cleanName, string sortName, string? originalTitle)
+        => new()
+        {
+            Id = id,
+            Type = "MediaBrowser.Controller.Entities.Movies.Movie",
+            Name = name,
+            CleanName = cleanName,
+            SortName = sortName,
+            OriginalTitle = originalTitle,
+            MediaType = "Video",
+            IsMovie = true,
+            IsFolder = false,
+            IsVirtualItem = false,
+            PresentationUniqueKey = id.ToString("N")
         };
 }

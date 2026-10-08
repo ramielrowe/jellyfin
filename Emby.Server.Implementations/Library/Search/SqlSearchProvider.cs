@@ -93,21 +93,20 @@ public class SqlSearchProvider : IInternalSearchProvider
         }
 
         var cleanSearchTerm = rawSearchTerm.GetCleanValue();
-        if (string.IsNullOrEmpty(cleanSearchTerm))
-        {
-            return [];
-        }
-
+        var hasCleanSearchTerm = !string.IsNullOrEmpty(cleanSearchTerm);
         var cleanPrefix = cleanSearchTerm + " ";
         // OriginalTitle is stored mixed-case and isn't pre-normalized like CleanName,
-        // so match it via a case-insensitive LIKE rather than a per-row case conversion
-        // that may not translate to SQL on every provider.
-        var likeOriginal = $"%{rawSearchTerm}%";
+        // so normalize both sides explicitly for equivalent SQLite/PostgreSQL semantics.
+        var originalSearchTerm = rawSearchTerm.ToLowerInvariant();
+        var originalPrefix = originalSearchTerm + " ";
+        var likeOriginal = $"%{originalSearchTerm.EscapeLikePattern()}%";
 
         // Great benefit for users with metadata in non-latin script
         // since SortName is among other things stored transliterated.
         var sortNameShape = BaseItem.GetSortName(rawSearchTerm, true, _configurationManager.Configuration);
-        var likeSortName = string.IsNullOrWhiteSpace(sortNameShape) ? null : $"%{sortNameShape}%";
+        var sortSearchTerm = sortNameShape?.ToLowerInvariant();
+        var sortPrefix = sortSearchTerm + " ";
+        var likeSortName = string.IsNullOrWhiteSpace(sortSearchTerm) ? null : $"%{sortSearchTerm.EscapeLikePattern()}%";
 
         var limit = query.Limit ?? DefaultSearchLimit;
 
@@ -123,15 +122,15 @@ public class SqlSearchProvider : IInternalSearchProvider
             if (likeSortName is null)
             {
                 dbQuery = dbQuery
-                    .Where(e => e.CleanName!.Contains(cleanSearchTerm)
-                        || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle, likeOriginal)));
+                    .Where(e => (hasCleanSearchTerm && e.CleanName!.Contains(cleanSearchTerm))
+                        || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle.ToLower(), likeOriginal, "\\")));
             }
             else
             {
                 dbQuery = dbQuery
-                    .Where(e => e.CleanName!.Contains(cleanSearchTerm)
-                        || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle, likeOriginal))
-                        || (e.SortName != null && EF.Functions.Like(e.SortName, likeSortName)));
+                    .Where(e => (hasCleanSearchTerm && e.CleanName!.Contains(cleanSearchTerm))
+                        || (e.OriginalTitle != null && EF.Functions.Like(e.OriginalTitle.ToLower(), likeOriginal, "\\"))
+                        || (e.SortName != null && EF.Functions.Like(e.SortName.ToLower(), likeSortName, "\\")));
             }
 
             dbQuery = ApplyTypeFilter(dbQuery, query.IncludeItemTypes, query.ExcludeItemTypes);
@@ -142,17 +141,23 @@ public class SqlSearchProvider : IInternalSearchProvider
 
             // Compute the score in SQL: the ternary translates to a CASE WHEN. CleanName is
             // the pre-normalized (lowercase, diacritic-stripped) form, so we score against it
-            // directly without any per-row case conversion. Items that match only via
-            // OriginalTitle fall through to the Contains tier.
+            // directly without any per-row case conversion. OriginalTitle and SortName are
+            // stored mixed-case, so their normalized forms participate in the same tiers.
             // Tie-break by Id for deterministic ordering so the explicit OrderBy + Take
             // satisfies EF Core's row-limiting-with-OrderBy requirement.
             var scored = dbQuery.Select(e => new
             {
                 e.Id,
                 Score =
-                    (e.CleanName == cleanSearchTerm) ? ExactMatchScore
-                    : e.CleanName!.StartsWith(cleanSearchTerm) ? PrefixMatchScore
-                    : e.CleanName!.Contains(cleanPrefix) ? WordPrefixMatchScore
+                    ((hasCleanSearchTerm && e.CleanName == cleanSearchTerm)
+                        || (e.OriginalTitle != null && e.OriginalTitle.ToLower() == originalSearchTerm)
+                        || (sortSearchTerm != null && e.SortName != null && e.SortName.ToLower() == sortSearchTerm)) ? ExactMatchScore
+                    : ((hasCleanSearchTerm && e.CleanName!.StartsWith(cleanSearchTerm))
+                        || (e.OriginalTitle != null && e.OriginalTitle.ToLower().StartsWith(originalSearchTerm))
+                        || (sortSearchTerm != null && e.SortName != null && e.SortName.ToLower().StartsWith(sortSearchTerm))) ? PrefixMatchScore
+                    : ((hasCleanSearchTerm && e.CleanName!.Contains(cleanPrefix))
+                        || (e.OriginalTitle != null && e.OriginalTitle.ToLower().Contains(originalPrefix))
+                        || (sortSearchTerm != null && e.SortName != null && e.SortName.ToLower().Contains(sortPrefix))) ? WordPrefixMatchScore
                     : ContainsMatchScore
             });
 

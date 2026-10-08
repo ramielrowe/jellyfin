@@ -79,26 +79,26 @@ public class ActivityManager : IActivityManager
 
             if (!string.IsNullOrEmpty(query.Name))
             {
-                var name = $"%{query.Name.ToLowerInvariant()}%";
-                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Name.ToLower(), name));
+                var name = $"%{query.Name.ToLowerInvariant().EscapeLikePattern()}%";
+                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Name.ToLower(), name, "\\"));
             }
 
             if (!string.IsNullOrEmpty(query.Overview))
             {
-                var overview = $"%{query.Overview.ToLowerInvariant()}%";
-                entries = entries.Where(e => e.ActivityLog.Overview != null && EF.Functions.Like(e.ActivityLog.Overview.ToLower(), overview));
+                var overview = $"%{query.Overview.ToLowerInvariant().EscapeLikePattern()}%";
+                entries = entries.Where(e => e.ActivityLog.Overview != null && EF.Functions.Like(e.ActivityLog.Overview.ToLower(), overview, "\\"));
             }
 
             if (!string.IsNullOrEmpty(query.ShortOverview))
             {
-                var shortOverview = $"%{query.ShortOverview.ToLowerInvariant()}%";
-                entries = entries.Where(e => e.ActivityLog.ShortOverview != null && EF.Functions.Like(e.ActivityLog.ShortOverview.ToLower(), shortOverview));
+                var shortOverview = $"%{query.ShortOverview.ToLowerInvariant().EscapeLikePattern()}%";
+                entries = entries.Where(e => e.ActivityLog.ShortOverview != null && EF.Functions.Like(e.ActivityLog.ShortOverview.ToLower(), shortOverview, "\\"));
             }
 
             if (!string.IsNullOrEmpty(query.Type))
             {
-                var type = $"%{query.Type.ToLowerInvariant()}%";
-                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Type.ToLower(), type));
+                var type = $"%{query.Type.ToLowerInvariant().EscapeLikePattern()}%";
+                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Type.ToLower(), type, "\\"));
             }
 
             if (!query.ItemId.IsNullOrEmpty())
@@ -109,8 +109,8 @@ public class ActivityManager : IActivityManager
 
             if (!string.IsNullOrEmpty(query.Username))
             {
-                var username = $"%{query.Username.ToLowerInvariant()}%";
-                entries = entries.Where(e => e.Username != null && EF.Functions.Like(e.Username.ToLower(), username));
+                var username = $"%{query.Username.ToLowerInvariant().EscapeLikePattern()}%";
+                entries = entries.Where(e => e.Username != null && EF.Functions.Like(e.Username.ToLower(), username, "\\"));
             }
 
             if (query.Severity is not null)

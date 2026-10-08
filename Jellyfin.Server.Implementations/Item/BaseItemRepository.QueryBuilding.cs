@@ -335,19 +335,38 @@ public sealed partial class BaseItemRepository
             _ => OrderMapper.MapOrderByField(sortBy, filter, context)
         };
 
+        Expression<Func<BaseItemEntity, bool>>? MapOrderByIsNullField(ItemSortBy sortBy)
+            => OrderMapper.MapOrderByIsNullField(sortBy, filter, context);
+
         if (orderBy.Length > 0)
         {
             var firstOrdering = orderBy[0];
             var expression = MapOrderByField(firstOrdering.OrderBy);
+            var isNullExpression = MapOrderByIsNullField(firstOrdering.OrderBy);
 
             if (orderedQuery is null)
             {
-                orderedQuery = firstOrdering.SortOrder == SortOrder.Ascending
-                    ? query.OrderBy(expression)
-                    : query.OrderByDescending(expression);
+                if (isNullExpression is null)
+                {
+                    orderedQuery = firstOrdering.SortOrder == SortOrder.Ascending
+                        ? query.OrderBy(expression)
+                        : query.OrderByDescending(expression);
+                }
+                else
+                {
+                    var nullOrderedQuery = query.OrderBy(isNullExpression);
+                    orderedQuery = firstOrdering.SortOrder == SortOrder.Ascending
+                        ? nullOrderedQuery.ThenBy(expression)
+                        : nullOrderedQuery.ThenByDescending(expression);
+                }
             }
             else
             {
+                if (isNullExpression is not null)
+                {
+                    orderedQuery = orderedQuery.ThenBy(isNullExpression);
+                }
+
                 orderedQuery = firstOrdering.SortOrder == SortOrder.Ascending
                     ? orderedQuery.ThenBy(expression)
                     : orderedQuery.ThenByDescending(expression);
@@ -355,6 +374,7 @@ public sealed partial class BaseItemRepository
 
             if (firstOrdering.OrderBy is ItemSortBy.Default or ItemSortBy.SortName)
             {
+                orderedQuery = orderedQuery.ThenBy(e => e.Name == null);
                 orderedQuery = firstOrdering.SortOrder == SortOrder.Ascending
                     ? orderedQuery.ThenBy(e => e.Name)
                     : orderedQuery.ThenByDescending(e => e.Name);
@@ -363,6 +383,12 @@ public sealed partial class BaseItemRepository
             foreach (var item in orderBy.Skip(1))
             {
                 expression = MapOrderByField(item.OrderBy);
+                var isNull = MapOrderByIsNullField(item.OrderBy);
+                if (isNull is not null)
+                {
+                    orderedQuery = orderedQuery.ThenBy(isNull);
+                }
+
                 orderedQuery = item.SortOrder == SortOrder.Ascending
                     ? orderedQuery.ThenBy(expression)
                     : orderedQuery.ThenByDescending(expression);
@@ -371,13 +397,13 @@ public sealed partial class BaseItemRepository
 
         if (orderedQuery is null)
         {
-            return query.OrderBy(e => e.SortName);
+            return query.OrderBy(e => e.SortName == null).ThenBy(e => e.SortName);
         }
 
         // Add SortName as final tiebreaker
         if (!hasSearch && (orderBy.Length == 0 || orderBy.All(o => o.OrderBy is not ItemSortBy.SortName and not ItemSortBy.Name)))
         {
-            orderedQuery = orderedQuery.ThenBy(e => e.SortName);
+            orderedQuery = orderedQuery.ThenBy(e => e.SortName == null).ThenBy(e => e.SortName);
         }
 
         return orderedQuery;

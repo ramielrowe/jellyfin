@@ -90,6 +90,31 @@ public static class OrderMapper
     }
 
     /// <summary>
+    /// Creates a provider-neutral null marker for an order expression. Sorting this marker ascending
+    /// before the value places nulls last on both SQLite and PostgreSQL.
+    /// </summary>
+    /// <param name="sortBy">Item property to sort by.</param>
+    /// <param name="query">Context query.</param>
+    /// <param name="jellyfinDbContext">Context.</param>
+    /// <returns>An expression which is true when the mapped ordering value is null, or <c>null</c> for a non-nullable key.</returns>
+    public static Expression<Func<BaseItemEntity, bool>>? MapOrderByIsNullField(ItemSortBy sortBy, InternalItemsQuery query, JellyfinDbContext jellyfinDbContext)
+    {
+        if (sortBy is ItemSortBy.Random
+            or ItemSortBy.IsFolder
+            or ItemSortBy.IsFavoriteOrLiked
+            or ItemSortBy.IsPlayed
+            or ItemSortBy.IsUnplayed)
+        {
+            return null;
+        }
+
+        var orderExpression = MapOrderByField(sortBy, query, jellyfinDbContext);
+        return Expression.Lambda<Func<BaseItemEntity, bool>>(
+            Expression.Equal(orderExpression.Body, Expression.Constant(null, typeof(object))),
+            orderExpression.Parameters);
+    }
+
+    /// <summary>
     /// Creates an expression to order search results by match quality.
     /// Prioritizes: exact match (0) > prefix match with word boundary (1) > prefix match (2) > contains (3).
     /// Considers both CleanName and OriginalTitle for matching.

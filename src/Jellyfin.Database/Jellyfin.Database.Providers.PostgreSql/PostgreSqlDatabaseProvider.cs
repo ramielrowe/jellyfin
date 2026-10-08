@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
+using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Providers.PostgreSql.ValueConverters;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
@@ -107,6 +108,61 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc/>
     public void OnModelCreating(ModelBuilder modelBuilder)
     {
+        var baseItems = modelBuilder.Entity<BaseItemEntity>();
+        // These values are application enum/type identifiers, not user-authored metadata. Bounding
+        // them retains the selective mixed-column B-trees without constraining titles or paths.
+        baseItems.Property(entity => entity.Type).HasMaxLength(512);
+        baseItems.Property(entity => entity.MediaType).HasMaxLength(512);
+
+        // PostgreSQL B-tree entries are limited to roughly one third of a page. SQLite accepts
+        // arbitrarily long indexed text, so the shared model intentionally leaves these properties
+        // unbounded. Keep unique application keys conservatively bounded for PostgreSQL and remove
+        // non-unique B-trees which could make an otherwise valid long value impossible to save.
+        // The hot single-column equality lookups are restored below as fixed-size hash indexes.
+        const int maximumCombinedIndexedCharacters = 512;
+        foreach (var entityType in modelBuilder.Model.GetEntityTypes())
+        {
+            foreach (var index in entityType.GetIndexes().ToArray())
+            {
+                var stringProperties = index.Properties
+                    .Where(property => property.ClrType == typeof(string))
+                    .ToArray();
+                if (stringProperties.Length == 0)
+                {
+                    continue;
+                }
+
+                if (index.IsUnique)
+                {
+                    var maximumPropertyLength = maximumCombinedIndexedCharacters / stringProperties.Length;
+                    foreach (var property in stringProperties)
+                    {
+                        if (!property.GetMaxLength().HasValue || property.GetMaxLength() > maximumPropertyLength)
+                        {
+                            property.SetMaxLength(maximumPropertyLength);
+                        }
+                    }
+                }
+                else if (stringProperties.Any(property => !property.GetMaxLength().HasValue)
+                         || stringProperties.Sum(property => property.GetMaxLength()!.Value) > maximumCombinedIndexedCharacters)
+                {
+                    entityType.RemoveIndex(index);
+                }
+            }
+        }
+
+        baseItems.HasIndex(entity => entity.Path).HasMethod("hash");
+        baseItems.HasIndex(entity => entity.Name).HasMethod("hash");
+        baseItems.HasIndex(entity => entity.CleanName).HasMethod("hash");
+        baseItems.HasIndex(entity => entity.PresentationUniqueKey).HasMethod("hash");
+        baseItems.HasIndex(entity => entity.SeriesName).HasMethod("hash");
+
+        // C gives the range and tie-breaker queries a stable ordinal collation, matching SQLite's
+        // default BINARY ordering rather than inheriting the PostgreSQL server's locale.
+        baseItems.Property(entity => entity.SortName).UseCollation("C");
+        baseItems.Property(entity => entity.CleanName).UseCollation("C");
+        baseItems.Property(entity => entity.OriginalTitle).UseCollation("C");
+        modelBuilder.Entity<People>().Property(entity => entity.Name).UseCollation("C");
     }
 
     /// <inheritdoc/>

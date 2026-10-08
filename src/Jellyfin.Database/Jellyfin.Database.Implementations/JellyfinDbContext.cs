@@ -325,11 +325,14 @@ public class JellyfinDbContext(DbContextOptions<JellyfinDbContext> options, ILog
     /// <inheritdoc />
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
-        jellyfinDatabaseProvider.OnModelCreating(modelBuilder);
         base.OnModelCreating(modelBuilder);
 
         // Configuration for each entity is in its own class inside 'ModelConfiguration'.
         modelBuilder.ApplyConfigurationsFromAssembly(typeof(JellyfinDbContext).Assembly);
+
+        // Provider-specific choices must run last so they can deliberately replace shared
+        // relational defaults (for example, an unsafe index method or a value converter).
+        jellyfinDatabaseProvider.OnModelCreating(modelBuilder);
     }
 
     /// <inheritdoc />
