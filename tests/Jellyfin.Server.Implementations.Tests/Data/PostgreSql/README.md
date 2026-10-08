@@ -48,3 +48,16 @@ administrator's native PostgreSQL backup and restore procedure. Jellyfin rejects
 purging data because that path cannot currently reseed every imported identity sequence safely.
 
 Do not use production credentials or point this test harness at a production server. Connection strings and credentials are not written to test output.
+
+## Behavioral provider matrix
+
+`ProviderBehaviorMatrixTests` is the shared SQLite/PostgreSQL persistence contract. Each test gets a clean schema and runs once per provider. It covers:
+
+- users, permissions, preferences, relationships, unique keys, and optimistic concurrency;
+- base-item and linked-child queries, empty/single/high-cardinality `WhereOneOrMany` inputs, partition boundaries, explicit null ordering, date ranges, paging, and bulk deletion;
+- people, item values, user data, nullable values, Unicode text, composite keys, and logical JSON serialization;
+- media streams and chapters, including ordered and null-valued fields;
+- activity-log service filtering, literal SQL `LIKE` metacharacters, date filters, paging, API keys, and devices;
+- transaction rollback and constraint enforcement.
+
+The matrix compares observable behavior, not SQL text or engine internals. PostgreSQL-specific schema, migration, index-planner, and lifecycle contracts remain in the other tests in this directory. PostgreSQL intentionally does not support Jellyfin's SQLite file-copy fast migration backup or full-system database backup/restore; those operations require administrator-managed PostgreSQL backup tooling.
