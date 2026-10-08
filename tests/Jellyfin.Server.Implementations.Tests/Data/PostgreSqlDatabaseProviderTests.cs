@@ -151,6 +151,34 @@ public class PostgreSqlDatabaseProviderTests
     }
 
     [Fact]
+    public void AppliedMigrationHistory_MustBeAKnownOrderedProviderPrefix()
+    {
+        const string Baseline = "20261008095117_InitialPostgreSqlBaseline";
+        const string Target = "20261008114025_AddActivityLogTypeDateIndex";
+        const string CodeMigration = "20250420000000_CreateNetworkConfiguration";
+        var provider = new PostgreSqlDatabaseProvider(Mock.Of<ILogger<PostgreSqlDatabaseProvider>>());
+
+        var supported = provider.ValidateAppliedMigrationHistory(
+            [CodeMigration, Baseline],
+            [Baseline, Target],
+            [CodeMigration]);
+        var future = provider.ValidateAppliedMigrationHistory(
+            [CodeMigration, Baseline, Target, "20990101000000_FuturePostgreSqlSchema"],
+            [Baseline, Target],
+            [CodeMigration]);
+        var gap = provider.ValidateAppliedMigrationHistory(
+            [CodeMigration, Target],
+            [Baseline, Target],
+            [CodeMigration]);
+
+        Assert.True(supported.Succeeded);
+        Assert.False(future.Succeeded);
+        Assert.Contains("not supported", future.ErrorMessage, StringComparison.Ordinal);
+        Assert.False(gap.Succeeded);
+        Assert.Contains("ordered prefix", gap.ErrorMessage, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Initialise_MalformedConnectionString_DoesNotExposePassword()
     {
         const string Password = "correct horse battery staple";

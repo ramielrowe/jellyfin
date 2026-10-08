@@ -11,6 +11,19 @@ namespace Jellyfin.Database.Implementations;
 public interface IDatabaseProviderMigrationPolicy
 {
     /// <summary>
+    /// Validates that the provider migration rows already recorded by a database describe a supported state.
+    /// </summary>
+    /// <param name="appliedMigrationIds">All migration identifiers recorded in the provider history table.</param>
+    /// <param name="knownProviderMigrationIds">The provider migrations known to this Jellyfin build, in application order.</param>
+    /// <param name="knownCodeMigrationIds">The non-provider code migrations known to this Jellyfin build.</param>
+    /// <returns>The validation result.</returns>
+    DatabaseProviderOperationResult ValidateAppliedMigrationHistory(
+        IReadOnlyCollection<string> appliedMigrationIds,
+        IReadOnlyList<string> knownProviderMigrationIds,
+        IReadOnlyCollection<string> knownCodeMigrationIds)
+        => DatabaseProviderOperationResult.Success();
+
+    /// <summary>
     /// Verifies that a database contains no application objects and can receive an initial provider migration
     /// without first protecting existing application data.
     /// </summary>

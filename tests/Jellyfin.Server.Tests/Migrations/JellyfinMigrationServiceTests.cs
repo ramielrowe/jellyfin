@@ -142,9 +142,10 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
         var provider = CreatePostgreSqlProviderMock(DatabaseProviderCapabilities.None);
         var service = CreateService(provider.Object);
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+        var exception = await Assert.ThrowsAsync<DatabaseProviderStartupException>(
             () => service.PrepareSystemForMigration(NullLogger<JellyfinMigrationService>.Instance));
 
+        Assert.Equal(DatabaseProviderStartupErrorCategory.UnsupportedBackup, exception.Category);
         Assert.Contains(DatabaseProviderKey.PostgreSql, exception.Message, StringComparison.Ordinal);
         Assert.Contains("does not support the fast backup and restore operation", exception.Message, StringComparison.Ordinal);
         provider.Verify(p => p.MigrationBackupFast(It.IsAny<CancellationToken>()), Times.Never);
@@ -181,9 +182,10 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
                 TestContext.Current.CancellationToken);
         }
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+        var exception = await Assert.ThrowsAsync<DatabaseProviderStartupException>(
             () => service.PrepareSystemForMigration(NullLogger<JellyfinMigrationService>.Instance));
 
+        Assert.Equal(DatabaseProviderStartupErrorCategory.UnsupportedBackup, exception.Category);
         Assert.Contains("does not support the fast backup and restore operation", exception.Message, StringComparison.Ordinal);
         provider.Verify(p => p.MigrationBackupFast(It.IsAny<CancellationToken>()), Times.Never);
     }
@@ -206,9 +208,10 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
         var provider = new LegacyDatabaseProvider(_paths, throwFromBackup: true);
         var service = CreateService(provider);
 
-        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+        var exception = await Assert.ThrowsAsync<DatabaseProviderStartupException>(
             () => service.PrepareSystemForMigration(NullLogger<JellyfinMigrationService>.Instance));
 
+        Assert.Equal(DatabaseProviderStartupErrorCategory.UnsupportedBackup, exception.Category);
         Assert.True(provider.MigrationBackupCalled);
         Assert.Contains(((IJellyfinDatabaseProvider)provider).ProviderKey, exception.Message, StringComparison.Ordinal);
         Assert.Contains("does not implement the fast backup operation", exception.Message, StringComparison.Ordinal);

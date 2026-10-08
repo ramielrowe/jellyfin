@@ -111,6 +111,7 @@ internal class JellyfinMigrationService
         var serverConfig = File.Exists(appPaths.SystemConfigurationFilePath)
             ? (ServerConfiguration)xmlSerializer.DeserializeFromFile(typeof(ServerConfiguration), appPaths.SystemConfigurationFilePath)!
             : new ServerConfiguration();
+        await ValidateAppliedProviderMigrationHistoryAsync().ConfigureAwait(false);
         _isFreshEmptyDatabaseInitialization = false;
         if (!serverConfig.IsStartupWizardCompleted || startupOptions.StartupMode is Configuration.StartupMode.SeedSystem)
         {
@@ -232,6 +233,52 @@ internal class JellyfinMigrationService
                     logger.LogCritical(ex, "Failed to apply migrations");
                     throw;
                 }
+            }
+        }
+    }
+
+    private async Task ValidateAppliedProviderMigrationHistoryAsync()
+    {
+        if (_jellyfinDatabaseProvider is not IDatabaseProviderMigrationPolicy migrationPolicy)
+        {
+            return;
+        }
+
+        var dbContext = await _dbContextFactory.CreateDbContextAsync().ConfigureAwait(false);
+        await using (dbContext.ConfigureAwait(false))
+        {
+            var databaseCreator = dbContext.Database.GetService<IDatabaseCreator>() as IRelationalDatabaseCreator
+                ?? throw new InvalidOperationException("Jellyfin does only support relational databases.");
+            if (!await databaseCreator.ExistsAsync().ConfigureAwait(false))
+            {
+                return;
+            }
+
+            var historyRepository = dbContext.GetService<IHistoryRepository>();
+            if (!await historyRepository.ExistsAsync().ConfigureAwait(false))
+            {
+                return;
+            }
+
+            var appliedMigrationIds = (await historyRepository.GetAppliedMigrationsAsync().ConfigureAwait(false))
+                .Select(row => row.MigrationId)
+                .ToArray();
+            var knownProviderMigrationIds = dbContext.GetService<IMigrationsAssembly>().Migrations.Keys
+                .Order(StringComparer.Ordinal)
+                .ToArray();
+            var knownCodeMigrationIds = Migrations.SelectMany(stage => stage)
+                .Select(migration => migration.BuildCodeMigrationId())
+                .ToArray();
+            var validation = migrationPolicy.ValidateAppliedMigrationHistory(
+                appliedMigrationIds,
+                knownProviderMigrationIds,
+                knownCodeMigrationIds);
+            if (!validation.Succeeded)
+            {
+                throw new DatabaseProviderStartupException(
+                    _jellyfinDatabaseProvider.ProviderKey,
+                    DatabaseProviderStartupErrorCategory.IncompatibleSchema,
+                    validation.ErrorMessage!);
             }
         }
     }
@@ -636,7 +683,12 @@ internal class JellyfinMigrationService
                         + "Startup has stopped before applying migrations. Back up the database using a provider-supported procedure before upgrading.");
                 if (!acknowledgement.Succeeded)
                 {
-                    throw new InvalidOperationException(acknowledgement.ErrorMessage);
+                    throw new DatabaseProviderStartupException(
+                        _jellyfinDatabaseProvider.ProviderKey,
+                        _jellyfinDatabaseProvider is IDatabaseProviderMigrationPolicy
+                            ? DatabaseProviderStartupErrorCategory.BackupRequired
+                            : DatabaseProviderStartupErrorCategory.UnsupportedBackup,
+                        acknowledgement.ErrorMessage!);
                 }
 
                 externalBackupAcknowledged = true;
@@ -654,7 +706,9 @@ internal class JellyfinMigrationService
                 }
                 catch (NotImplementedException ex) when (_jellyfinDatabaseProvider.Capabilities == DatabaseProviderCapabilities.Unknown)
                 {
-                    throw new InvalidOperationException(
+                    throw new DatabaseProviderStartupException(
+                        _jellyfinDatabaseProvider.ProviderKey,
+                        DatabaseProviderStartupErrorCategory.UnsupportedBackup,
                         $"Legacy database provider '{_jellyfinDatabaseProvider.ProviderKey}' does not implement the fast backup operation required before pending migrations. "
                         + "Startup has stopped before applying migrations. Back up the database using a provider-supported procedure before upgrading.",
                         ex);

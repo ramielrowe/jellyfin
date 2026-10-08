@@ -175,22 +175,7 @@ namespace Jellyfin.Server
             var configurationCompleted = false;
             try
             {
-                _jellyfinHost = Host.CreateDefaultBuilder()
-                    .UseConsoleLifetime()
-                    .ConfigureServices(services => appHost.Init(services))
-                    .ConfigureWebHostDefaults(webHostBuilder =>
-                    {
-                        webHostBuilder.ConfigureWebHostBuilder(appHost, startupConfig, appPaths, _logger);
-                        if (bool.TryParse(Environment.GetEnvironmentVariable("JELLYFIN_ENABLE_IIS"), out var iisEnabled) && iisEnabled)
-                        {
-                            _logger.LogCritical("UNSUPPORTED HOSTING ENVIRONMENT Microsoft Internet Information Services. The option to run Jellyfin on IIS is an unsupported and untested feature. Only use at your own discretion.");
-                            webHostBuilder.UseIIS();
-                        }
-                    })
-                    .ConfigureAppConfiguration(config => config.ConfigureAppConfiguration(options, appPaths, startupConfig))
-                    .UseSerilog()
-                    .ConfigureServices(e => e.RegisterStartupLogger())
-                    .Build();
+                _jellyfinHost = BuildJellyfinHost(appHost, appPaths, options, startupConfig, _logger);
 
                 /*
                  * Initialize the transcode path marker so we avoid starting Jellyfin in a broken state.
@@ -211,20 +196,11 @@ namespace Jellyfin.Server
                     return;
                 }
 
-                var jellyfinMigrationService = ActivatorUtilities.CreateInstance<JellyfinMigrationService>(appHost.ServiceProvider);
-                SetupServer.ReportActivity(StartupActivity.PreparingMigrations);
-                await jellyfinMigrationService.PrepareSystemForMigration(_logger).ConfigureAwait(false);
-                // "Preparing migrations" carries through the DB read; per-migration progress is reported
-                // as "Running migration X of Y" from inside the step once the pending set is known.
-                _optimizeDatabaseAfterMigration |= await jellyfinMigrationService.MigrateStepAsync(JellyfinMigrationStageTypes.CoreInitialisation, appHost.ServiceProvider).ConfigureAwait(false);
-
-                SetupServer.ReportActivity(StartupActivity.InitializingServices);
-                await appHost.InitializeServices(startupConfig).ConfigureAwait(false);
-                _appHost = appHost;
-
-                _optimizeDatabaseAfterMigration |= await jellyfinMigrationService.MigrateStepAsync(JellyfinMigrationStageTypes.AppInitialisation, appHost.ServiceProvider).ConfigureAwait(false);
-                await jellyfinMigrationService.CleanupSystemAfterMigration(_logger).ConfigureAwait(false);
-                await OptimizeDatabaseAfterMigrationAsync(appHost.ServiceProvider).ConfigureAwait(false);
+                await RunCoreStartupLifecycleAsync(
+                    appHost,
+                    startupConfig,
+                    _logger,
+                    () => _appHost = appHost).ConfigureAwait(false);
                 try
                 {
                     configurationCompleted = true;
@@ -289,8 +265,7 @@ namespace Jellyfin.Server
                 {
                     _logger.LogInformation("Preparing the database for shutdown...");
 
-                    var databaseProvider = appHost.ServiceProvider.GetRequiredService<IJellyfinDatabaseProvider>();
-                    await databaseProvider.RunShutdownTask(CancellationToken.None).ConfigureAwait(false);
+                    await ShutdownDatabaseProviderAsync(appHost.ServiceProvider).ConfigureAwait(false);
                 }
 
                 _appHost = null;
@@ -298,6 +273,60 @@ namespace Jellyfin.Server
                 _jellyfinHost = null;
             }
         }
+
+        internal static IHost BuildJellyfinHost(
+            CoreAppHost appHost,
+            IServerApplicationPaths appPaths,
+            StartupOptions options,
+            IConfiguration startupConfig,
+            ILogger logger)
+        {
+            return Host.CreateDefaultBuilder()
+                .UseConsoleLifetime()
+                .ConfigureServices(services => appHost.Init(services))
+                .ConfigureWebHostDefaults(webHostBuilder =>
+                {
+                    webHostBuilder.ConfigureWebHostBuilder(appHost, startupConfig, appPaths, logger);
+                    if (bool.TryParse(Environment.GetEnvironmentVariable("JELLYFIN_ENABLE_IIS"), out var iisEnabled) && iisEnabled)
+                    {
+                        logger.LogCritical("UNSUPPORTED HOSTING ENVIRONMENT Microsoft Internet Information Services. The option to run Jellyfin on IIS is an unsupported and untested feature. Only use at your own discretion.");
+                        webHostBuilder.UseIIS();
+                    }
+                })
+                .ConfigureAppConfiguration(config => config.ConfigureAppConfiguration(options, appPaths, startupConfig))
+                .UseSerilog()
+                .ConfigureServices(services => services.RegisterStartupLogger())
+                .Build();
+        }
+
+        internal static async Task RunCoreStartupLifecycleAsync(
+            CoreAppHost appHost,
+            IConfiguration startupConfig,
+            ILogger logger,
+            Action? servicesInitialized = null)
+        {
+            ArgumentNullException.ThrowIfNull(appHost.ServiceProvider);
+            PrepareDatabaseProvider(appHost.ServiceProvider);
+
+            var jellyfinMigrationService = ActivatorUtilities.CreateInstance<JellyfinMigrationService>(appHost.ServiceProvider);
+            SetupServer.ReportActivity(StartupActivity.PreparingMigrations);
+            await jellyfinMigrationService.PrepareSystemForMigration(logger).ConfigureAwait(false);
+            // "Preparing migrations" carries through the DB read; per-migration progress is reported
+            // as "Running migration X of Y" from inside the step once the pending set is known.
+            _optimizeDatabaseAfterMigration |= await jellyfinMigrationService.MigrateStepAsync(JellyfinMigrationStageTypes.CoreInitialisation, appHost.ServiceProvider).ConfigureAwait(false);
+
+            SetupServer.ReportActivity(StartupActivity.InitializingServices);
+            await appHost.InitializeServices(startupConfig).ConfigureAwait(false);
+            servicesInitialized?.Invoke();
+
+            _optimizeDatabaseAfterMigration |= await jellyfinMigrationService.MigrateStepAsync(JellyfinMigrationStageTypes.AppInitialisation, appHost.ServiceProvider).ConfigureAwait(false);
+            await jellyfinMigrationService.CleanupSystemAfterMigration(logger).ConfigureAwait(false);
+            await OptimizeDatabaseAfterMigrationAsync(appHost.ServiceProvider).ConfigureAwait(false);
+        }
+
+        internal static Task ShutdownDatabaseProviderAsync(IServiceProvider serviceProvider)
+            => serviceProvider.GetRequiredService<IJellyfinDatabaseProvider>()
+                .RunShutdownTask(CancellationToken.None);
 
         /// <summary>
         /// [Internal]Runs the startup Migrations.

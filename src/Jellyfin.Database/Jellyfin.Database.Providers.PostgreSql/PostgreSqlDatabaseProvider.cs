@@ -376,6 +376,44 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider, IDat
     }
 
     /// <inheritdoc/>
+    public DatabaseProviderOperationResult ValidateAppliedMigrationHistory(
+        IReadOnlyCollection<string> appliedMigrationIds,
+        IReadOnlyList<string> knownProviderMigrationIds,
+        IReadOnlyCollection<string> knownCodeMigrationIds)
+    {
+        ArgumentNullException.ThrowIfNull(appliedMigrationIds);
+        ArgumentNullException.ThrowIfNull(knownProviderMigrationIds);
+        ArgumentNullException.ThrowIfNull(knownCodeMigrationIds);
+
+        var knownCodeMigrationIdSet = knownCodeMigrationIds.ToHashSet(StringComparer.Ordinal);
+        var appliedProviderMigrationIds = appliedMigrationIds
+            .Where(migrationId => IsProviderMigrationId(migrationId) && !knownCodeMigrationIdSet.Contains(migrationId))
+            .ToHashSet(StringComparer.Ordinal);
+        var knownProviderMigrationIdSet = knownProviderMigrationIds.ToHashSet(StringComparer.Ordinal);
+        var unknownProviderMigrationId = appliedProviderMigrationIds
+            .Where(migrationId => !knownProviderMigrationIdSet.Contains(migrationId))
+            .Order(StringComparer.Ordinal)
+            .FirstOrDefault();
+        if (unknownProviderMigrationId is not null)
+        {
+            return DatabaseProviderOperationResult.Failure(
+                $"The PostgreSQL database records provider migration '{unknownProviderMigrationId}' which is not supported by this Jellyfin build. "
+                + "Install a Jellyfin version that supports the database schema or restore a compatible PostgreSQL backup. No database changes were made.");
+        }
+
+        var appliedCount = appliedProviderMigrationIds.Count;
+        if (appliedCount > knownProviderMigrationIds.Count
+            || knownProviderMigrationIds.Take(appliedCount).Any(migrationId => !appliedProviderMigrationIds.Contains(migrationId)))
+        {
+            return DatabaseProviderOperationResult.Failure(
+                "The PostgreSQL provider migration history is not a supported ordered prefix for this Jellyfin build. "
+                + "Restore a compatible PostgreSQL backup before starting Jellyfin. No database changes were made.");
+        }
+
+        return DatabaseProviderOperationResult.Success();
+    }
+
+    /// <inheritdoc/>
     public DatabaseProviderOperationResult ValidateExternalMigrationBackupAcknowledgement(
         IReadOnlyCollection<string> pendingMigrationIds)
     {
@@ -436,6 +474,14 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider, IDat
         DatabaseProviderStartupErrorCategory category,
         string message)
         => new(DatabaseProviderKey.PostgreSql, category, message);
+
+    private static bool IsProviderMigrationId(string migrationId)
+    {
+        const int TimestampLength = 14;
+        return migrationId.Length > TimestampLength + 1
+            && migrationId[TimestampLength] == '_'
+            && migrationId.AsSpan(0, TimestampLength).IndexOfAnyExceptInRange('0', '9') < 0;
+    }
 
     /// <inheritdoc/>
     public Task<string> MigrationBackupFast(CancellationToken cancellationToken)

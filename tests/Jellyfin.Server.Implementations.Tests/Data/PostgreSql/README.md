@@ -53,10 +53,12 @@ migration id. Set that value only after creating and verifying an administrator-
 specific upgrade. A stale acknowledgement does not authorize a later upgrade, and Jellyfin cannot automatically
 restore the external backup if a migration fails.
 
-`PostgreSqlStartupLifecycleTests` runs through the production pre-start and core migration services. It proves an
-empty pre-created database can start and restart, upgrades a checked-in predecessor migration state while preserving
-representative related data, and exercises credential, connectivity, schema-permission, incompatible-schema, and
-missing-backup-acknowledgement failures. These scenarios are PostgreSQL-to-PostgreSQL only; a SQLite database or
+`PostgreSqlStartupLifecycleTests` builds the real `CoreAppHost` with the production host builder and runs the same
+pre-initialisation, migration preparation, core migration, service initialisation, app migration, cleanup,
+optimisation, and provider-shutdown entry points as server startup. It proves an empty pre-created database can start
+and restart, upgrades a predecessor PostgreSQL migration state while preserving data read through production-resolved
+services, and exercises credential, connectivity, schema-permission, incompatible/future schema, and exact backup-
+acknowledgement failures without mutation. These scenarios are PostgreSQL-to-PostgreSQL only; a SQLite database or
 backup is not an input to them and changing `DatabaseType` does not migrate SQLite data.
 
 Do not use production credentials or point this test harness at a production server. Connection strings and credentials are not written to test output.

@@ -21,6 +21,16 @@ public enum DatabaseProviderStartupErrorCategory
     Permission,
 
     /// <summary>
+    /// A migration requires an operator-managed backup acknowledgement before it can run.
+    /// </summary>
+    BackupRequired,
+
+    /// <summary>
+    /// The configured provider cannot satisfy a migration's backup requirement.
+    /// </summary>
+    UnsupportedBackup,
+
+    /// <summary>
     /// The database contains objects that do not match a supported schema state.
     /// </summary>
     IncompatibleSchema

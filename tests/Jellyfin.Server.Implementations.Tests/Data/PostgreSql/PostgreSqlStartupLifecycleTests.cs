@@ -8,21 +8,26 @@ using System.Threading.Tasks;
 using Emby.Server.Implementations;
 using Emby.Server.Implementations.Configuration;
 using Emby.Server.Implementations.Serialization;
+using Jellyfin.Data.Queries;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Database.Implementations.Entities;
+using Jellyfin.Server.Helpers;
 using Jellyfin.Server.Implementations.DatabaseConfiguration;
 using Jellyfin.Server.Implementations.Extensions;
 using Jellyfin.Server.Migrations;
 using Jellyfin.Server.Migrations.Stages;
 using Jellyfin.Server.ServerSetupApp;
 using MediaBrowser.Common.Configuration;
+using MediaBrowser.Controller.Library;
+using MediaBrowser.Model.Activity;
 using MediaBrowser.Model.Configuration;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit;
 
@@ -47,48 +52,43 @@ public sealed class PostgreSqlStartupLifecycleTests
         var root = CreateTemporaryRoot("fresh");
         var paths = CreateApplicationPaths(root);
         var timestamp = new DateTime(2026, 10, 8, 10, 30, 0, DateTimeKind.Utc);
-        var parentId = Guid.NewGuid();
-        var childId = Guid.NewGuid();
-        var user = new User("postgres-lifecycle", "test-auth", "test-reset");
-        var activity = new ActivityLog("fresh startup", "PostgreSqlLifecycle", user.Id) { DateCreated = timestamp };
+        Guid userId;
+        int firstActivityId;
 
         try
         {
             WriteConfiguration(paths, database.ConnectionString, wizardCompleted: false);
-            await RunProductionStartupAsync(paths).ConfigureAwait(true);
-
-            await using (var context = database.CreateDbContext())
+            await using (var firstStart = await StartProductionHostAsync(paths).ConfigureAwait(true))
             {
-                context.Users.Add(user);
-                context.BaseItems.AddRange(
-                    new BaseItemEntity { Id = parentId, Type = "Folder", IsFolder = true },
-                    new BaseItemEntity { Id = childId, Type = "Movie", ParentId = parentId });
-                context.ActivityLogs.Add(activity);
-                await context.SaveChangesAsync(cancellationToken).ConfigureAwait(true);
-                Assert.True(activity.Id > 0);
+                var user = await firstStart.Services.GetRequiredService<IUserManager>()
+                    .CreateUserAsync("postgres-lifecycle").ConfigureAwait(true);
+                userId = user.Id;
+                var activity = new ActivityLog("fresh startup", "PostgreSqlLifecycle", userId) { DateCreated = timestamp };
+                await firstStart.Services.GetRequiredService<IActivityManager>().CreateAsync(activity).ConfigureAwait(true);
+                firstActivityId = activity.Id;
+                Assert.True(firstActivityId > 0);
             }
 
             WriteConfiguration(paths, database.ConnectionString, wizardCompleted: true);
-            await RunProductionStartupAsync(paths).ConfigureAwait(true);
+            await using var restart = await StartProductionHostAsync(paths).ConfigureAwait(true);
+            Assert.Equal(userId, restart.Services.GetRequiredService<IUserManager>().GetUserById(userId)!.Id);
+            var activities = await restart.Services.GetRequiredService<IActivityManager>()
+                .GetPagedResultAsync(new ActivityLogQuery { HasUserId = true, Limit = 100 }).ConfigureAwait(true);
+            var storedActivity = Assert.Single(activities.Items, item => item.Id == firstActivityId);
+            Assert.Equal(timestamp, storedActivity.Date);
+            Assert.Equal(userId, storedActivity.UserId);
 
-            await using var verification = database.CreateDbContext();
-            Assert.Equal(2, await verification.BaseItems.CountAsync(
-                item => item.Id.Equals(parentId) || item.Id.Equals(childId),
-                cancellationToken).ConfigureAwait(true));
-            Assert.Equal(parentId, (await verification.BaseItems.SingleAsync(
-                item => item.Id.Equals(childId),
-                cancellationToken).ConfigureAwait(true)).ParentId);
-            Assert.Equal(user.Id, (await verification.Users.SingleAsync(
-                item => item.Id.Equals(user.Id),
-                cancellationToken).ConfigureAwait(true)).Id);
-            var storedActivity = await verification.ActivityLogs.SingleAsync(
-                item => item.Id == activity.Id,
-                cancellationToken).ConfigureAwait(true);
-            Assert.Equal(timestamp, storedActivity.DateCreated);
-            Assert.Equal(user.Id, storedActivity.UserId);
-            Assert.Equal(
-                verification.Database.GetMigrations(),
-                await GetAppliedProviderMigrationIdsAsync(verification, cancellationToken).ConfigureAwait(true));
+            var laterActivity = new ActivityLog("after restart", "PostgreSqlLifecycle", userId)
+            {
+                DateCreated = timestamp.AddMinutes(1)
+            };
+            await restart.Services.GetRequiredService<IActivityManager>().CreateAsync(laterActivity).ConfigureAwait(true);
+            Assert.True(laterActivity.Id > firstActivityId);
+
+            await using var verification = await restart.Services
+                .GetRequiredService<IDbContextFactory<JellyfinDbContext>>()
+                .CreateDbContextAsync(cancellationToken).ConfigureAwait(true);
+            Assert.Equal(verification.Database.GetMigrations(), await GetAppliedProviderMigrationIdsAsync(verification, cancellationToken).ConfigureAwait(true));
             Assert.Contains(
                 await verification.GetService<IHistoryRepository>().GetAppliedMigrationsAsync(cancellationToken).ConfigureAwait(true),
                 row => row.MigrationId.EndsWith("_StripEmbeddedLinkedChildren", StringComparison.Ordinal));
@@ -139,24 +139,36 @@ public sealed class PostgreSqlStartupLifecycleTests
                 cancellationToken).ConfigureAwait(true));
             WriteConfiguration(paths, database.ConnectionString, wizardCompleted: true, targetMigrationId);
 
-            await RunProductionStartupAsync(paths).ConfigureAwait(true);
+            await using (var upgraded = await StartProductionHostAsync(paths).ConfigureAwait(true))
+            {
+                Assert.Equal(user.Id, upgraded.Services.GetRequiredService<IUserManager>().GetUserById(user.Id)!.Id);
+                var activities = await upgraded.Services.GetRequiredService<IActivityManager>()
+                    .GetPagedResultAsync(new ActivityLogQuery { HasUserId = true, Limit = 100 }).ConfigureAwait(true);
+                var storedActivity = Assert.Single(activities.Items, item => item.Id == activity.Id);
+                Assert.Equal(timestamp, storedActivity.Date);
+                Assert.Equal(user.Id, storedActivity.UserId);
+            }
 
-            await using var verification = database.CreateDbContext();
-            Assert.Equal(
-                new[] { baselineMigrationId, targetMigrationId },
-                await GetAppliedProviderMigrationIdsAsync(verification, cancellationToken).ConfigureAwait(true));
+            // A real second production lifecycle rebuilds the provider and every repository/service singleton.
+            await using var restarted = await StartProductionHostAsync(paths).ConfigureAwait(true);
+            Assert.Equal(user.Id, restarted.Services.GetRequiredService<IUserManager>().GetUserById(user.Id)!.Id);
+            var laterActivity = new ActivityLog("post-upgrade restart", "PostgreSqlLifecycle", user.Id)
+            {
+                DateCreated = timestamp.AddDays(1)
+            };
+            await restarted.Services.GetRequiredService<IActivityManager>().CreateAsync(laterActivity).ConfigureAwait(true);
+            Assert.True(laterActivity.Id > activity.Id);
+
+            var afterRestart = await restarted.Services.GetRequiredService<IActivityManager>()
+                .GetPagedResultAsync(new ActivityLogQuery { HasUserId = true, Limit = 100 }).ConfigureAwait(true);
+            Assert.Contains(afterRestart.Items, item => item.Id == activity.Id && item.UserId.Equals(user.Id) && item.Date == timestamp);
+            Assert.Contains(afterRestart.Items, item => item.Id == laterActivity.Id && item.UserId.Equals(user.Id) && item.Date == timestamp.AddDays(1));
+
+            await using var verification = await restarted.Services
+                .GetRequiredService<IDbContextFactory<JellyfinDbContext>>()
+                .CreateDbContextAsync(cancellationToken).ConfigureAwait(true);
+            Assert.Equal(new[] { baselineMigrationId, targetMigrationId }, await GetAppliedProviderMigrationIdsAsync(verification, cancellationToken).ConfigureAwait(true));
             Assert.Empty(await verification.Database.GetPendingMigrationsAsync(cancellationToken).ConfigureAwait(true));
-            Assert.Equal(parentId, (await verification.BaseItems.SingleAsync(
-                item => item.Id.Equals(childId),
-                cancellationToken).ConfigureAwait(true)).ParentId);
-            Assert.Equal(user.Id, (await verification.Users.SingleAsync(
-                item => item.Id.Equals(user.Id),
-                cancellationToken).ConfigureAwait(true)).Id);
-            var storedActivity = await verification.ActivityLogs.SingleAsync(
-                item => item.Id == activity.Id,
-                cancellationToken).ConfigureAwait(true);
-            Assert.Equal(timestamp, storedActivity.DateCreated);
-            Assert.Equal(user.Id, storedActivity.UserId);
             Assert.True(await database.ExecuteScalarAsync<bool>(
                 "SELECT EXISTS (SELECT FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'IX_ActivityLogs_Type_DateCreated')",
                 cancellationToken).ConfigureAwait(true));
@@ -189,16 +201,13 @@ public sealed class PostgreSqlStartupLifecycleTests
             }
 
             WriteConfiguration(paths, database.ConnectionString, wizardCompleted: true);
-            await global::Jellyfin.Server.Program.ApplyStartupMigrationAsync(
-                paths,
-                CreateStartupConfiguration(),
-                new StartupOptions()).ConfigureAwait(true);
-            await using var services = CreateCoreMigrationServices(paths);
-            var migrationService = ActivatorUtilities.CreateInstance<JellyfinMigrationService>(services);
+            var exception = await Assert.ThrowsAsync<DatabaseProviderStartupException>(
+                async () =>
+                {
+                    await using var ignored = await StartProductionHostAsync(paths).ConfigureAwait(true);
+                }).ConfigureAwait(true);
 
-            var exception = await Assert.ThrowsAsync<InvalidOperationException>(
-                () => migrationService.PrepareSystemForMigration(NullLogger.Instance)).ConfigureAwait(true);
-
+            Assert.Equal(DatabaseProviderStartupErrorCategory.BackupRequired, exception.Category);
             Assert.Contains(PostgreSqlDatabaseProviderOptions.MigrationBackupAcknowledgement, exception.Message, StringComparison.Ordinal);
             await using var verification = database.CreateDbContext();
             Assert.Single(await GetAppliedProviderMigrationIdsAsync(verification, cancellationToken).ConfigureAwait(true));
@@ -237,6 +246,7 @@ public sealed class PostgreSqlStartupLifecycleTests
             Assert.Equal(DatabaseProviderStartupErrorCategory.Authentication, exception.Category);
             Assert.Contains("username", exception.Message, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain(Secret, exception.ToString(), StringComparison.Ordinal);
+            Assert.False(await database.TableExistsAsync("__EFMigrationsHistory", cancellationToken).ConfigureAwait(true));
         }
         finally
         {
@@ -270,6 +280,7 @@ public sealed class PostgreSqlStartupLifecycleTests
 
             Assert.Equal(DatabaseProviderStartupErrorCategory.Connectivity, exception.Category);
             Assert.Contains("host and port", exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.False(await database.TableExistsAsync("__EFMigrationsHistory", cancellationToken).ConfigureAwait(true));
         }
         finally
         {
@@ -298,6 +309,7 @@ public sealed class PostgreSqlStartupLifecycleTests
 
             Assert.Equal(DatabaseProviderStartupErrorCategory.Permission, exception.Category);
             Assert.Contains("USAGE and CREATE", exception.Message, StringComparison.Ordinal);
+            Assert.False(await database.TableExistsAsync("__EFMigrationsHistory", cancellationToken).ConfigureAwait(true));
         }
         finally
         {
@@ -336,38 +348,198 @@ public sealed class PostgreSqlStartupLifecycleTests
         }
     }
 
-    private static async Task RunProductionStartupAsync(ServerApplicationPaths paths)
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ProductionStartup_StaleOrWrongBackupAcknowledgementStopsBeforeMutation(bool useStaleAcknowledgement)
     {
-        await global::Jellyfin.Server.Program.ApplyStartupMigrationAsync(
-            paths,
-            CreateStartupConfiguration(),
-            new StartupOptions()).ConfigureAwait(false);
-        await using var services = CreateCoreMigrationServices(paths);
-        var migrationService = ActivatorUtilities.CreateInstance<JellyfinMigrationService>(services);
-        await migrationService.PrepareSystemForMigration(NullLogger.Instance).ConfigureAwait(false);
-        await migrationService.MigrateStepAsync(JellyfinMigrationStageTypes.CoreInitialisation, services).ConfigureAwait(false);
-        await migrationService.CleanupSystemAfterMigration(NullLogger.Instance).ConfigureAwait(false);
+        Assert.SkipUnless(_fixture.IsConfigured, _fixture.SkipReason);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var database = await _fixture.CreateIsolatedDatabaseAsync(cancellationToken).ConfigureAwait(true);
+        var root = CreateTemporaryRoot(useStaleAcknowledgement ? "stale-acknowledgement" : "wrong-acknowledgement");
+        var paths = CreateApplicationPaths(root);
+        var markerId = Guid.NewGuid();
+
+        try
+        {
+            string baselineMigrationId;
+            await using (var predecessor = database.CreateDbContext())
+            {
+                var migrations = predecessor.Database.GetMigrations().ToArray();
+                baselineMigrationId = migrations[0];
+                await predecessor.GetService<IMigrator>().MigrateAsync(baselineMigrationId, cancellationToken).ConfigureAwait(true);
+                await SeedAllCodeMigrationHistoryAsync(predecessor, cancellationToken).ConfigureAwait(true);
+                predecessor.BaseItems.Add(new BaseItemEntity { Id = markerId, Type = "Movie", Data = "acknowledgement-marker" });
+                await predecessor.SaveChangesAsync(cancellationToken).ConfigureAwait(true);
+            }
+
+            var historyBefore = await GetAllMigrationIdsAsync(database, cancellationToken).ConfigureAwait(true);
+            WriteConfiguration(
+                paths,
+                database.ConnectionString,
+                wizardCompleted: true,
+                useStaleAcknowledgement ? baselineMigrationId : "not-a-supported-migration-target");
+
+            var exception = await Assert.ThrowsAsync<DatabaseProviderStartupException>(
+                async () =>
+                {
+                    await using var ignored = await StartProductionHostAsync(paths).ConfigureAwait(true);
+                }).ConfigureAwait(true);
+
+            Assert.Equal(DatabaseProviderStartupErrorCategory.BackupRequired, exception.Category);
+            Assert.Equal(historyBefore, await GetAllMigrationIdsAsync(database, cancellationToken).ConfigureAwait(true));
+            await using var verification = database.CreateDbContext();
+            Assert.Equal("acknowledgement-marker", (await verification.BaseItems.FindAsync([markerId], cancellationToken).ConfigureAwait(true))!.Data);
+            Assert.False(await database.ExecuteScalarAsync<bool>(
+                "SELECT EXISTS (SELECT FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'IX_ActivityLogs_Type_DateCreated')",
+                cancellationToken).ConfigureAwait(true));
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
     }
 
-    private static ServiceProvider CreateCoreMigrationServices(ServerApplicationPaths paths)
+    [Fact]
+    public async Task ProductionStartup_FutureProviderMigrationHistoryReturnsIncompatibleSchemaWithoutMutation()
     {
-        var configurationManager = new ServerConfigurationManager(paths, NullLoggerFactory.Instance, new MyXmlSerializer());
-        configurationManager.AddParts([new DatabaseConfigurationFactory()]);
-        var services = new ServiceCollection()
-            .AddLogging()
-            .AddJellyfinDbContext(configurationManager, CreateStartupConfiguration())
-            .AddSingleton<IApplicationPaths>(paths)
-            .AddSingleton(paths)
-            .RegisterStartupLogger()
-            .BuildServiceProvider();
-        var factory = services.GetRequiredService<IDbContextFactory<JellyfinDbContext>>();
-        services.GetRequiredService<IJellyfinDatabaseProvider>().DbContextFactory = factory;
-        return services;
+        Assert.SkipUnless(_fixture.IsConfigured, _fixture.SkipReason);
+        const string FutureMigrationId = "20990101000000_FuturePostgreSqlSchema";
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var database = await _fixture.CreateIsolatedDatabaseAsync(cancellationToken).ConfigureAwait(true);
+        var root = CreateTemporaryRoot("future-history");
+        var paths = CreateApplicationPaths(root);
+        var markerId = Guid.NewGuid();
+
+        try
+        {
+            await using (var predecessor = database.CreateDbContext())
+            {
+                var baselineMigrationId = predecessor.Database.GetMigrations().First();
+                await predecessor.GetService<IMigrator>().MigrateAsync(baselineMigrationId, cancellationToken).ConfigureAwait(true);
+                await SeedAllCodeMigrationHistoryAsync(predecessor, cancellationToken).ConfigureAwait(true);
+                predecessor.BaseItems.Add(new BaseItemEntity { Id = markerId, Type = "Movie", Data = "future-history-marker" });
+                await predecessor.SaveChangesAsync(cancellationToken).ConfigureAwait(true);
+                var historyRepository = predecessor.GetService<IHistoryRepository>();
+                await predecessor.Database.ExecuteSqlRawAsync(
+                    historyRepository.GetInsertScript(new HistoryRow(FutureMigrationId, "future")),
+                    cancellationToken).ConfigureAwait(true);
+            }
+
+            var historyBefore = await GetAllMigrationIdsAsync(database, cancellationToken).ConfigureAwait(true);
+            WriteConfiguration(paths, database.ConnectionString, wizardCompleted: true, FutureMigrationId);
+
+            var exception = await Assert.ThrowsAsync<DatabaseProviderStartupException>(
+                () => global::Jellyfin.Server.Program.ApplyStartupMigrationAsync(
+                    paths,
+                    CreateStartupConfiguration(),
+                    new StartupOptions())).ConfigureAwait(true);
+
+            Assert.Equal(DatabaseProviderStartupErrorCategory.IncompatibleSchema, exception.Category);
+            Assert.Contains(FutureMigrationId, exception.Message, StringComparison.Ordinal);
+            Assert.Equal(historyBefore, await GetAllMigrationIdsAsync(database, cancellationToken).ConfigureAwait(true));
+            await using var verification = database.CreateDbContext();
+            Assert.Equal("future-history-marker", (await verification.BaseItems.FindAsync([markerId], cancellationToken).ConfigureAwait(true))!.Data);
+            Assert.False(await database.ExecuteScalarAsync<bool>(
+                "SELECT EXISTS (SELECT FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'IX_ActivityLogs_Type_DateCreated')",
+                cancellationToken).ConfigureAwait(true));
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
+    public async Task ProductionStartup_PendingCodeMigrationBackupRequirementUsesBackupRequiredCategoryWithoutMutation()
+    {
+        Assert.SkipUnless(_fixture.IsConfigured, _fixture.SkipReason);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        await using var database = await _fixture.CreateIsolatedDatabaseAsync(cancellationToken).ConfigureAwait(true);
+        var root = CreateTemporaryRoot("code-migration-backup");
+        var paths = CreateApplicationPaths(root);
+        var markerId = Guid.NewGuid();
+        var pendingCodeMigrationId = GetBackupRequiringAppMigrationId();
+
+        try
+        {
+            await using (var predecessor = database.CreateDbContext())
+            {
+                await predecessor.Database.MigrateAsync(cancellationToken).ConfigureAwait(true);
+                await SeedAllCodeMigrationHistoryAsync(predecessor, cancellationToken, pendingCodeMigrationId).ConfigureAwait(true);
+                predecessor.BaseItems.Add(new BaseItemEntity { Id = markerId, Type = "Movie", Data = "code-migration-marker" });
+                await predecessor.SaveChangesAsync(cancellationToken).ConfigureAwait(true);
+            }
+
+            var historyBefore = await GetAllMigrationIdsAsync(database, cancellationToken).ConfigureAwait(true);
+            WriteConfiguration(paths, database.ConnectionString, wizardCompleted: true);
+
+            var exception = await Assert.ThrowsAsync<DatabaseProviderStartupException>(
+                async () =>
+                {
+                    await using var ignored = await StartProductionHostAsync(paths).ConfigureAwait(true);
+                }).ConfigureAwait(true);
+
+            Assert.Equal(DatabaseProviderStartupErrorCategory.BackupRequired, exception.Category);
+            Assert.Contains(pendingCodeMigrationId, exception.Message, StringComparison.Ordinal);
+            Assert.Equal(historyBefore, await GetAllMigrationIdsAsync(database, cancellationToken).ConfigureAwait(true));
+            await using var verification = database.CreateDbContext();
+            Assert.Equal("code-migration-marker", (await verification.BaseItems.FindAsync([markerId], cancellationToken).ConfigureAwait(true))!.Data);
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    private static async Task<ProductionHostSession> StartProductionHostAsync(ServerApplicationPaths paths)
+    {
+        var startupConfiguration = CreateStartupConfiguration();
+        var startupOptions = new StartupOptions();
+        await StartupHelpers.InitLoggingConfigFile(paths).ConfigureAwait(false);
+        await global::Jellyfin.Server.Program.ApplyStartupMigrationAsync(
+            paths,
+            startupConfiguration,
+            startupOptions).ConfigureAwait(false);
+
+        var appHost = new global::Jellyfin.Server.CoreAppHost(
+            paths,
+            NullLoggerFactory.Instance,
+            startupOptions,
+            startupConfiguration);
+        IHost? host = null;
+        try
+        {
+            host = global::Jellyfin.Server.Program.BuildJellyfinHost(
+                appHost,
+                paths,
+                startupOptions,
+                startupConfiguration,
+                NullLogger.Instance);
+            appHost.ServiceProvider = host.Services;
+            await global::Jellyfin.Server.Program.RunCoreStartupLifecycleAsync(
+                appHost,
+                startupConfiguration,
+                NullLogger.Instance).ConfigureAwait(false);
+            return new ProductionHostSession(appHost, host);
+        }
+        catch
+        {
+            if (appHost.ServiceProvider is not null)
+            {
+                await global::Jellyfin.Server.Program.ShutdownDatabaseProviderAsync(appHost.ServiceProvider).ConfigureAwait(false);
+            }
+
+            host?.Dispose();
+            appHost.Dispose();
+            throw;
+        }
     }
 
     private static async Task SeedAllCodeMigrationHistoryAsync(
         JellyfinDbContext context,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        string? excludedMigrationId = null)
     {
         var historyRepository = context.GetService<IHistoryRepository>();
         var existing = (await historyRepository.GetAppliedMigrationsAsync(cancellationToken).ConfigureAwait(false))
@@ -377,6 +549,7 @@ public sealed class PostgreSqlStartupLifecycleTests
             .Select(type => (Type: type, Metadata: type.GetCustomAttribute<JellyfinMigrationAttribute>()))
             .Where(item => item.Metadata is not null)
             .Select(item => new CodeMigration(item.Type, item.Metadata!, null).BuildCodeMigrationId())
+            .Where(migrationId => !string.Equals(migrationId, excludedMigrationId, StringComparison.Ordinal))
             .Where(migrationId => existing.Add(migrationId));
         foreach (var migrationId in codeMigrationIds)
         {
@@ -384,6 +557,30 @@ public sealed class PostgreSqlStartupLifecycleTests
                 historyRepository.GetInsertScript(new HistoryRow(migrationId, "predecessor")),
                 cancellationToken).ConfigureAwait(false);
         }
+    }
+
+    private static string GetBackupRequiringAppMigrationId()
+        => typeof(JellyfinMigrationService).Assembly.GetTypes()
+            .Select(type => new
+            {
+                Type = type,
+                Metadata = type.GetCustomAttribute<JellyfinMigrationAttribute>(),
+                Backup = type.GetCustomAttributes<JellyfinMigrationBackupAttribute>()
+            })
+            .Where(item => item.Metadata?.Stage is JellyfinMigrationStageTypes.AppInitialisation && item.Backup.Any(backup => backup.JellyfinDb))
+            .Select(item => new CodeMigration(item.Type, item.Metadata!, null).BuildCodeMigrationId())
+            .OrderDescending(StringComparer.Ordinal)
+            .First();
+
+    private static async Task<string[]> GetAllMigrationIdsAsync(
+        PostgreSqlTestDatabase database,
+        CancellationToken cancellationToken)
+    {
+        await using var context = database.CreateDbContext();
+        return (await context.GetService<IHistoryRepository>().GetAppliedMigrationsAsync(cancellationToken).ConfigureAwait(false))
+            .Select(row => row.MigrationId)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
     }
 
     private static async Task<string[]> GetAppliedProviderMigrationIdsAsync(
@@ -455,5 +652,17 @@ public sealed class PostgreSqlStartupLifecycleTests
         Directory.CreateDirectory(paths.ConfigurationDirectoryPath);
         Directory.CreateDirectory(paths.CachePath);
         return paths;
+    }
+
+    private sealed class ProductionHostSession(CoreAppHost appHost, IHost host) : IAsyncDisposable
+    {
+        public IServiceProvider Services => host.Services;
+
+        public async ValueTask DisposeAsync()
+        {
+            await global::Jellyfin.Server.Program.ShutdownDatabaseProviderAsync(host.Services).ConfigureAwait(false);
+            host.Dispose();
+            appHost.Dispose();
+        }
     }
 }
