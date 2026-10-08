@@ -102,6 +102,58 @@ public sealed class PostgreSqlStartupLifecycleTests
     }
 
     [Fact]
+    public async Task ProductionStartup_AdministratorOwnedDatabaseRunsWithDocumentedRuntimeGrants()
+    {
+        Assert.SkipUnless(_fixture.IsConfigured, _fixture.SkipReason);
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var root = CreateTemporaryRoot("administrator-owned");
+        var paths = CreateApplicationPaths(root);
+        string databaseName;
+
+        try
+        {
+            await using (var database = await _fixture.CreateAdministratorOwnedDatabaseAsync(cancellationToken).ConfigureAwait(true))
+            {
+                databaseName = database.DatabaseName;
+                Assert.True(await database.ExecuteScalarAsync<bool>(
+                    """
+                    SELECT pg_get_userbyid(datdba) <> current_user
+                        AND has_database_privilege(current_user, current_database(), 'CONNECT')
+                        AND has_schema_privilege(current_user, 'public', 'USAGE')
+                        AND has_schema_privilege(current_user, 'public', 'CREATE')
+                    FROM pg_database
+                    WHERE datname = current_database()
+                    """,
+                    cancellationToken).ConfigureAwait(true));
+
+                WriteConfiguration(paths, database.ConnectionString, wizardCompleted: false);
+                await using var session = await StartProductionHostAsync(paths).ConfigureAwait(true);
+                var activity = new ActivityLog("administrator-owned", "PostgreSqlLifecycle", Guid.Empty);
+                await session.Services.GetRequiredService<IActivityManager>().CreateAsync(activity).ConfigureAwait(true);
+
+                var provider = session.Services.GetRequiredService<IJellyfinDatabaseProvider>();
+                await provider.RefreshStatistics(cancellationToken).ConfigureAwait(true);
+                await provider.RunScheduledOptimisation(cancellationToken).ConfigureAwait(true);
+
+                await using var context = await session.Services
+                    .GetRequiredService<IDbContextFactory<JellyfinDbContext>>()
+                    .CreateDbContextAsync(cancellationToken).ConfigureAwait(true);
+                Assert.Empty(await context.Database.GetPendingMigrationsAsync(cancellationToken).ConfigureAwait(true));
+                Assert.Equal(1, await context.ActivityLogs.CountAsync(cancellationToken).ConfigureAwait(true));
+                Assert.True(await database.ExecuteScalarAsync<bool>(
+                    "SELECT last_analyze IS NOT NULL AND last_vacuum IS NOT NULL FROM pg_stat_user_tables WHERE schemaname = 'public' AND relname = 'ActivityLogs'",
+                    cancellationToken).ConfigureAwait(true));
+            }
+
+            Assert.False(await _fixture.DatabaseExistsAsync(databaseName, cancellationToken).ConfigureAwait(true));
+        }
+        finally
+        {
+            Directory.Delete(root, true);
+        }
+    }
+
+    [Fact]
     public async Task ProductionStartup_PredecessorPostgreSqlSchemaUpgradesWithoutDataLoss()
     {
         Assert.SkipUnless(_fixture.IsConfigured, _fixture.SkipReason);

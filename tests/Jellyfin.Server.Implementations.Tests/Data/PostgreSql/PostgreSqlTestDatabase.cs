@@ -44,7 +44,8 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         string administratorConnectionString,
         string runtimeConnectionString,
         CancellationToken cancellationToken,
-        Action<string>? databaseCreated = null)
+        Action<string>? databaseCreated = null,
+        bool runtimeOwnsDatabase = true)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -83,9 +84,18 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
                 }
 
                 command.CommandText = "CREATE DATABASE " + QuoteOwnedDatabaseName(databaseName)
-                    + " OWNER " + QuoteIdentifier(runtimeBuilder.Username!);
+                    + (runtimeOwnsDatabase ? " OWNER " + QuoteIdentifier(runtimeBuilder.Username!) : string.Empty);
                 createDatabaseAttempted = true;
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            if (!runtimeOwnsDatabase)
+            {
+                await GrantRuntimeDatabaseAccessAsync(
+                    normalizedAdministratorConnectionString,
+                    runtimeBuilder.Username!,
+                    databaseName,
+                    cancellationToken).ConfigureAwait(false);
             }
 
             runtimeBuilder.Pooling = false;
@@ -448,6 +458,28 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
         await using var connection = await administratorDataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = "DROP DATABASE IF EXISTS " + QuoteOwnedDatabaseName(databaseName) + " WITH (FORCE)";
+        await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task GrantRuntimeDatabaseAccessAsync(
+        string administratorConnectionString,
+        string runtimeRole,
+        string databaseName,
+        CancellationToken cancellationToken)
+    {
+        var administratorBuilder = new NpgsqlConnectionStringBuilder(administratorConnectionString)
+        {
+            Database = databaseName,
+            Pooling = false
+        };
+        await using var dataSource = NpgsqlDataSource.Create(administratorBuilder.ConnectionString);
+        await using var connection = await dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "REVOKE ALL ON DATABASE " + QuoteOwnedDatabaseName(databaseName)
+            + " FROM PUBLIC; GRANT CONNECT ON DATABASE " + QuoteOwnedDatabaseName(databaseName)
+            + " TO " + QuoteIdentifier(runtimeRole)
+            + "; REVOKE CREATE ON SCHEMA public FROM PUBLIC; GRANT USAGE, CREATE ON SCHEMA public TO "
+            + QuoteIdentifier(runtimeRole);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 

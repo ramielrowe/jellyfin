@@ -40,8 +40,9 @@ that the Jellyfin runtime role is `NOSUPERUSER`, `NOCREATEROLE`, and `NOCREATEDB
 requirement. `JELLYFIN_POSTGRES_TEST_REQUIRED=true` turns either missing connection string into a test failure instead
 of a skip, so CI cannot silently omit this suite. As a safety check, the database in the harness connection string must
 contain `jellyfin_test` in its name. The fixture never modifies or drops that administrator database. It creates
-databases named `jellyfin_test_<random-guid>` owned by the runtime role, resets non-system schemas only within those
-databases, and drops them after the run.
+databases named `jellyfin_test_<random-guid>`, resets non-system schemas only within those databases, and drops them
+after the run. Most tests make the runtime role the database owner. The documented deployment test instead keeps the
+harness role as owner and grants the runtime role only `CONNECT` plus `USAGE, CREATE` on the `public` schema.
 
 PostgreSQL does not advertise Jellyfin fast-migration backup or full-system database backup/restore support. Use your
 administrator's native PostgreSQL backup and restore procedure. Jellyfin rejects its logical database restore before

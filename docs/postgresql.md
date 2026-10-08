@@ -20,6 +20,9 @@ database-creation privileges. It needs `CONNECT` on its database and `USAGE` and
 Entity Framework can create and upgrade Jellyfin's tables. The same login owns the objects it creates, which lets it
 run Jellyfin's table maintenance.
 
+Only the `public` schema is supported. Do not set Npgsql's `Search Path` connection option or otherwise redirect
+Jellyfin objects into another schema.
+
 The following `psql` session prompts for the login password instead of putting it in shell history. Replace the role
 and database names if required:
 
@@ -67,10 +70,10 @@ untrusted network.
 
 The connection string is parsed by Npgsql. `Timeout` controls connection establishment, while the
 `command-timeout` custom option controls database command execution and defaults to 30 seconds. Npgsql pooling is
-enabled by default; `Pooling`, `Minimum Pool Size`, `Maximum Pool Size`, `Connection Idle Lifetime`, and other Npgsql
-connection-string options can be appended when the database administrator has selected values appropriate for the
-server's connection budget. Each Jellyfin process has its own pool. Do not increase its maximum without accounting for
-other clients and PostgreSQL's `max_connections`.
+enabled by default. The supported optional connection settings are transport, TLS, observability, and pool controls
+which do not change schema or SQL behavior, such as `Application Name`, `Keepalive`, `Pooling`, `Minimum Pool Size`,
+`Maximum Pool Size`, and `Connection Idle Lifetime`. Each Jellyfin process has its own pool. Do not increase its
+maximum without accounting for other clients and PostgreSQL's `max_connections`, and do not set `Search Path`.
 
 ### Keep credentials out of configuration
 
@@ -85,6 +88,11 @@ account (mode `0600` on Unix-like systems), and protect `database.xml` with the 
 commit either file, paste credentials into logs, or expose secrets through command-line arguments. If a deployment
 cannot use a passfile, store the password in `database.xml` only after applying equivalent file permissions.
 
+An embedded `Password` in `database.xml` is copied into every Jellyfin configuration or full-system backup archive
+that includes that file. Store and transfer those archives as secrets; if an archive is exposed, rotate the PostgreSQL
+credential. A `Passfile` keeps the password itself out of Jellyfin's archives, but the archived configuration still
+reveals the database endpoint and passfile path and should remain access-controlled.
+
 ## First startup and upgrades
 
 On the first start, Jellyfin validates the connection, confirms that the database is empty, and applies the PostgreSQL
@@ -92,10 +100,11 @@ baseline migration. Restarting the same version is safe. Authentication, connect
 permissions, a conflicting schema, an unknown future migration, or a gapped migration history stops startup without
 silently selecting SQLite.
 
-For a later PostgreSQL-to-PostgreSQL Jellyfin upgrade, Jellyfin stops before pending migrations until the operator has
-made and verified an external PostgreSQL backup. The startup error reports the newest pending migration identifier.
-After testing that the backup can be restored by the database administrator, add this entry inside the `Options`
-element, using that exact identifier:
+Most PostgreSQL-to-PostgreSQL Jellyfin upgrades apply automatically. An acknowledgement is required only when startup
+stops and reports a pending provider/database migration or a backup-requiring code migration. After the database
+administrator has made and verified an external PostgreSQL backup, add this entry inside the `Options` element. Use
+the exact identifier reported by that startup error: it is the newest migration in the subset which requires a
+database backup, not necessarily the newest of every pending migration:
 
 ```xml
 <CustomDatabaseOption>
@@ -144,7 +153,7 @@ Common startup failures have these remedies:
 
 - Authentication: verify the login, passfile entry, host authentication rules, and secret-file permissions.
 - Connectivity or timeout: verify DNS, host, port, TLS trust, firewall rules, and PostgreSQL availability.
-- Permission denied: grant only `CONNECT` on the database and `USAGE, CREATE` on the target schema; make sure the
+- Permission denied: grant only `CONNECT` on the database and `USAGE, CREATE` on the `public` schema; make sure the
   Jellyfin role still owns the objects it created.
 - Conflicting or incompatible schema: do not edit `__EFMigrationsHistory`; use an empty database for a new server or
   restore a compatible PostgreSQL backup.

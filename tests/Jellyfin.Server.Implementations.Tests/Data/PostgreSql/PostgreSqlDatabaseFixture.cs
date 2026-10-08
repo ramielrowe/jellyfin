@@ -93,6 +93,20 @@ public sealed class PostgreSqlDatabaseFixture : IAsyncLifetime
             databaseCreated);
     }
 
+    internal Task<PostgreSqlTestDatabase> CreateAdministratorOwnedDatabaseAsync(CancellationToken cancellationToken)
+    {
+        if (!IsConfigured)
+        {
+            throw new InvalidOperationException(SkipReason);
+        }
+
+        return PostgreSqlTestDatabase.CreateAsync(
+            _administratorConnectionString!,
+            _runtimeConnectionString!,
+            cancellationToken,
+            runtimeOwnsDatabase: false);
+    }
+
     public async ValueTask DisposeAsync()
     {
         await _initializationLock.WaitAsync().ConfigureAwait(false);
