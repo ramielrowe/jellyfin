@@ -13,15 +13,33 @@ docker run --rm --name jellyfin-postgres-tests \
   postgres:16.6-alpine
 ```
 
+The image creates `POSTGRES_USER` as a superuser. In another shell, create the restricted role that runs the tests.
+`CREATEDB` is needed only by the test harness to isolate test runs:
+
+```sh
+docker exec jellyfin-postgres-tests \
+  psql -v ON_ERROR_STOP=1 -U jellyfin_test_admin -d jellyfin_test_admin \
+  -c "CREATE ROLE jellyfin_test_runner LOGIN PASSWORD 'jellyfin-test-only' NOSUPERUSER NOCREATEROLE CREATEDB"
+```
+
 In another shell, run the tests:
 
 ```sh
-export JELLYFIN_POSTGRES_TEST_CONNECTION_STRING='Host=127.0.0.1;Port=55432;Database=jellyfin_test_admin;Username=jellyfin_test_admin;Password=jellyfin-test-only'
+export JELLYFIN_POSTGRES_TEST_CONNECTION_STRING='Host=127.0.0.1;Port=55432;Database=jellyfin_test_admin;Username=jellyfin_test_runner;Password=jellyfin-test-only'
 export JELLYFIN_POSTGRES_TEST_REQUIRED=true
 dotnet test tests/Jellyfin.Server.Implementations.Tests/Jellyfin.Server.Implementations.Tests.csproj \
   --filter 'FullyQualifiedName~Data.PostgreSql'
 ```
 
-The configured role must be able to create databases. `JELLYFIN_POSTGRES_TEST_REQUIRED=true` turns a missing connection string into a test failure instead of a skip, so CI cannot silently omit this suite. As a safety check, the database in the supplied connection string must contain `jellyfin_test` in its name. The fixture never modifies or drops that administrator database. It creates databases named `jellyfin_test_<random-guid>`, resets all non-system schemas only within those databases, and drops them after the run.
+The fixture verifies that the configured role is `NOSUPERUSER`, `NOCREATEROLE`, and `CREATEDB`. `CREATEDB` is a
+test-harness requirement, not a Jellyfin runtime requirement. `JELLYFIN_POSTGRES_TEST_REQUIRED=true` turns a missing
+connection string into a test failure instead of a skip, so CI cannot silently omit this suite. As a safety check, the
+database in the supplied connection string must contain `jellyfin_test` in its name. The fixture never modifies or
+drops that administrator database. It creates databases named `jellyfin_test_<random-guid>`, resets all non-system
+schemas only within those databases, and drops them after the run.
+
+PostgreSQL does not advertise Jellyfin fast-migration backup or full-system database backup/restore support. Use your
+administrator's native PostgreSQL backup and restore procedure. Jellyfin rejects its logical database restore before
+purging data because that path cannot currently reseed every imported identity sequence safely.
 
 Do not use production credentials or point this test harness at a production server. Connection strings and credentials are not written to test output.

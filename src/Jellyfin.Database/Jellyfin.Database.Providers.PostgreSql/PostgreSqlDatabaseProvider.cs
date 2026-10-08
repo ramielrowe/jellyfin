@@ -40,6 +40,10 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     public string ProviderKey => DatabaseProviderKey.PostgreSql;
 
     /// <inheritdoc/>
+    /// <remarks>
+    /// Jellyfin's logical restore path cannot currently reseed every identity after importing explicit values,
+    /// so both full-system database backup/restore and fast migration backup remain gated off before mutation.
+    /// </remarks>
     public DatabaseProviderCapabilities Capabilities => DatabaseProviderCapabilities.None;
 
     /// <inheritdoc/>
@@ -386,7 +390,8 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         // A single TRUNCATE statement lets PostgreSQL validate all foreign-key relationships before
         // changing any data. Deliberately omit CASCADE so an unexpected table outside the supplied
         // Jellyfin model can never be modified. RESTART IDENTITY resets only sequences owned by the
-        // tables being purged and makes subsequent generated keys safe for an empty logical restore.
+        // tables being purged. This only resets an empty database; it does not reseed identities after
+        // explicit values are imported. PostgreSQL full-system restore therefore remains unsupported.
         var sql = $"TRUNCATE TABLE {string.Join(", ", quotedTables)} RESTART IDENTITY";
         var ownsTransaction = dbContext.Database.CurrentTransaction is null;
         await using var transaction = ownsTransaction
@@ -408,9 +413,27 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
         var context = await factory.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         await using (context.ConfigureAwait(false))
         {
+            var quotedTables = context.Model.GetEntityTypes()
+                .Select(entityType => new
+                {
+                    Schema = entityType.GetSchema(),
+                    Table = entityType.GetTableName()
+                })
+                .Where(table => table.Table is not null)
+                .Select(table => QuoteTableName(table.Schema, table.Table!))
+                .Distinct(StringComparer.Ordinal)
+                .Order(StringComparer.Ordinal)
+                .ToArray();
+            if (quotedTables.Length == 0)
+            {
+                return;
+            }
+
             // The configured PostgreSQL command timeout bounds this server-side operation. VACUUM
-            // intentionally runs outside a transaction, as PostgreSQL requires.
-            await context.Database.ExecuteSqlRawAsync(command, cancellationToken).ConfigureAwait(false);
+            // intentionally runs outside a transaction, as PostgreSQL requires. Always enumerate the
+            // model-owned tables so maintenance cannot affect unrelated objects in the same database.
+            var sql = $"{command} {string.Join(", ", quotedTables)}";
+            await context.Database.ExecuteSqlRawAsync(sql, cancellationToken).ConfigureAwait(false);
         }
     }
 

@@ -133,6 +133,11 @@ public interface IJellyfinDatabaseProvider
     /// <summary>
     /// Removes all contents from the database.
     /// </summary>
+    /// <remarks>
+    /// Purging prepares an empty database but does not guarantee that provider-generated values are safe after
+    /// records with explicit generated values are imported. A provider advertising full-system restore must also
+    /// perform any required post-import identity or sequence reseeding; otherwise it must reject restore before purge.
+    /// </remarks>
     /// <param name="dbContext">The Database context.</param>
     /// <param name="tableNames">The names of the tables to purge or null for all tables to be purged.</param>
     /// <returns>A Task.</returns>

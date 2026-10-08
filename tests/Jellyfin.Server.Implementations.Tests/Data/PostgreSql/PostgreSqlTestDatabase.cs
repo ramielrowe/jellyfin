@@ -60,6 +60,13 @@ internal sealed class PostgreSqlTestDatabase : IAsyncDisposable
             await using (var connection = await administratorDataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false))
             await using (var command = connection.CreateCommand())
             {
+                command.CommandText = "SELECT NOT rolsuper AND NOT rolcreaterole AND rolcreatedb FROM pg_roles WHERE rolname = current_user";
+                if (await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not true)
+                {
+                    throw new InvalidOperationException(
+                        "The PostgreSQL integration-test role must be NOSUPERUSER, NOCREATEROLE, and CREATEDB; see Data/PostgreSql/README.md.");
+                }
+
                 command.CommandText = "CREATE DATABASE " + QuoteOwnedDatabaseName(databaseName);
                 createDatabaseAttempted = true;
                 await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
