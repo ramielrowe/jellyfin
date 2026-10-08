@@ -57,8 +57,9 @@ restore the external backup if a migration fails.
 pre-initialisation, migration preparation, core migration, service initialisation, app migration, cleanup,
 optimisation, and provider-shutdown entry points as server startup. It proves an empty pre-created database can start
 and restart, upgrades a predecessor PostgreSQL migration state while preserving data read through production-resolved
-services, and exercises credential, connectivity, schema-permission, incompatible/future schema, and exact backup-
-acknowledgement failures without mutation. These scenarios are PostgreSQL-to-PostgreSQL only; a SQLite database or
+services, and exercises credential, connectivity, schema-permission, and incompatible/future/gapped schema failures.
+The exact backup acknowledgement authorizes and applies the pending migration; missing, stale, and wrong
+acknowledgements are rejected without mutation. These scenarios are PostgreSQL-to-PostgreSQL only; a SQLite database or
 backup is not an input to them and changing `DatabaseType` does not migrate SQLite data.
 
 Do not use production credentials or point this test harness at a production server. Connection strings and credentials are not written to test output.
