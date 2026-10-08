@@ -332,7 +332,11 @@ internal class JellyfinMigrationService
                             migrationLogger.LogInformation("Attempt to rollback JellyfinDb.");
                             try
                             {
-                                await _jellyfinDatabaseProvider.RestoreBackupFast(_backupKey.JellyfinDb, CancellationToken.None).ConfigureAwait(false);
+                                var restoreResult = await _jellyfinDatabaseProvider.TryRestoreBackupFast(_backupKey.JellyfinDb, CancellationToken.None).ConfigureAwait(false);
+                                if (!restoreResult.Succeeded)
+                                {
+                                    throw new InvalidOperationException(restoreResult.ErrorMessage ?? "The database provider could not restore the fast migration backup.");
+                                }
                             }
                             catch (Exception inner)
                             {
@@ -391,7 +395,11 @@ internal class JellyfinMigrationService
                 logger.LogInformation("Attempt to cleanup JellyfinDb backup.");
                 try
                 {
-                    await _jellyfinDatabaseProvider.DeleteBackup(_backupKey.JellyfinDb).ConfigureAwait(false);
+                    var deleteResult = await _jellyfinDatabaseProvider.TryDeleteBackup(_backupKey.JellyfinDb).ConfigureAwait(false);
+                    if (!deleteResult.Succeeded)
+                    {
+                        logger.LogCritical("Could not cleanup JellyfinDb backup: {ErrorMessage}", deleteResult.ErrorMessage);
+                    }
                 }
                 catch (Exception inner)
                 {
@@ -475,6 +483,13 @@ internal class JellyfinMigrationService
 
         if (backupInstruction.JellyfinDb && _jellyfinDatabaseProvider is not null)
         {
+            if (!_jellyfinDatabaseProvider.Capabilities.HasFlag(DatabaseProviderCapabilities.FastMigrationBackup))
+            {
+                throw new InvalidOperationException(
+                    $"Database provider '{_jellyfinDatabaseProvider.ProviderKey}' does not support the fast backup and restore operation required before pending migrations. "
+                    + "Startup has stopped before applying migrations. Back up the database using a provider-supported procedure before upgrading.");
+            }
+
             logger.LogInformation("A migration will attempt to modify the jellyfin.db, will attempt to backup the file now.");
             _backupKey = (_backupKey.LibraryDb, await _jellyfinDatabaseProvider.MigrationBackupFast(CancellationToken.None).ConfigureAwait(false), _backupKey.FullBackup);
             logger.LogInformation("Jellyfin database has been backed up as {BackupPath}", _backupKey.JellyfinDb);

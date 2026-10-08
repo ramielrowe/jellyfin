@@ -4,7 +4,7 @@ using System.Collections.ObjectModel;
 namespace Jellyfin.Database.Implementations.DbConfiguration;
 
 /// <summary>
-/// Defines the options for a custom database connector.
+/// Defines connection and provider-specific options for a database connector.
 /// </summary>
 public class CustomDatabaseOptions
 {
@@ -19,7 +19,8 @@ public class CustomDatabaseOptions
     public required string PluginAssembly { get; set; }
 
     /// <summary>
-    /// Gets or sets the connection string for the custom database provider.
+    /// Gets or sets the connection string for the database provider.
+    /// This value can contain credentials and must not be written to logs or exception messages.
     /// </summary>
     public required string ConnectionString { get; set; }
 

@@ -120,7 +120,69 @@ public sealed class BackupServiceTests : IDisposable
         Assert.Equal(validItemId, singleRow.GetProperty("ItemId").GetGuid());
     }
 
-    private BackupService CreateBackupService()
+    [Fact]
+    public async Task CreateBackupAsync_RecordsDatabaseProviderIdentity()
+    {
+        var backupService = CreateBackupService();
+
+        var manifest = await backupService.CreateBackupAsync(new BackupOptionsDto()).ConfigureAwait(true);
+
+        Assert.Equal(DatabaseProviderKey.Sqlite, manifest.DatabaseProvider);
+        using var archive = await ZipFile.OpenReadAsync(manifest.Path, TestContext.Current.CancellationToken).ConfigureAwait(true);
+        var manifestEntry = archive.GetEntry("manifest.json");
+        Assert.NotNull(manifestEntry);
+        await using var manifestStream = await manifestEntry.OpenAsync(TestContext.Current.CancellationToken).ConfigureAwait(true);
+        using var document = await JsonDocument.ParseAsync(manifestStream, cancellationToken: TestContext.Current.CancellationToken).ConfigureAwait(true);
+        Assert.Equal(DatabaseProviderKey.Sqlite, document.RootElement.GetProperty("DatabaseProvider").GetString());
+    }
+
+    [Fact]
+    public async Task CreateBackupAsync_WhenDatabaseBackupIsUnsupported_FailsBeforeOptimization()
+    {
+        var provider = CreateDatabaseProvider("Unsupported", DatabaseProviderCapabilities.None);
+        var backupService = CreateBackupService(provider);
+
+        var exception = await Assert.ThrowsAsync<NotSupportedException>(
+            () => backupService.CreateBackupAsync(new BackupOptionsDto()));
+
+        Assert.Contains("Unsupported", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("does not support full-system database backup", exception.Message, StringComparison.Ordinal);
+        provider.Verify(p => p.RunScheduledOptimisation(It.IsAny<CancellationToken>()), Times.Never);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_WithDifferentDatabaseProvider_RejectsBeforeRestore()
+    {
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto()).ConfigureAwait(true);
+        var provider = CreateDatabaseProvider("Jellyfin-PgSql", DatabaseProviderCapabilities.FullSystemRestore);
+        var backupService = CreateBackupService(provider);
+
+        var exception = await Assert.ThrowsAsync<NotSupportedException>(() => backupService.RestoreBackupAsync(manifest.Path));
+
+        Assert.Contains(DatabaseProviderKey.Sqlite, exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Jellyfin-PgSql", exception.Message, StringComparison.Ordinal);
+        Assert.Contains("Cross-provider database restore is not supported", exception.Message, StringComparison.Ordinal);
+        provider.Verify(
+            p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()),
+            Times.Never);
+    }
+
+    [Fact]
+    public async Task RestoreBackupAsync_WhenDatabaseRestoreIsUnsupported_FailsBeforeRestore()
+    {
+        var manifest = await CreateBackupService().CreateBackupAsync(new BackupOptionsDto()).ConfigureAwait(true);
+        var provider = CreateDatabaseProvider(DatabaseProviderKey.Sqlite, DatabaseProviderCapabilities.None);
+        var backupService = CreateBackupService(provider);
+
+        var exception = await Assert.ThrowsAsync<NotSupportedException>(() => backupService.RestoreBackupAsync(manifest.Path));
+
+        Assert.Contains("does not support full-system database restore", exception.Message, StringComparison.Ordinal);
+        provider.Verify(
+            p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>()),
+            Times.Never);
+    }
+
+    private BackupService CreateBackupService(Mock<IJellyfinDatabaseProvider>? jellyfinDatabaseProvider = null)
     {
         var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
         factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
@@ -137,9 +199,7 @@ public sealed class BackupServiceTests : IDisposable
         applicationPaths.Setup(a => a.InternalMetadataPath).Returns(Path.Combine(_testRoot, "Metadata"));
         applicationPaths.Setup(a => a.DefaultInternalMetadataPath).Returns(Path.Combine(_testRoot, "MetadataDefault"));
 
-        var jellyfinDatabaseProvider = new Mock<IJellyfinDatabaseProvider>();
-        jellyfinDatabaseProvider.Setup(p => p.RunScheduledOptimisation(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
-        jellyfinDatabaseProvider.Setup(p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>())).Returns(Task.CompletedTask);
+        jellyfinDatabaseProvider ??= CreateDatabaseProvider(DatabaseProviderKey.Sqlite, DatabaseProviderCapabilities.All);
 
         var applicationLifetime = new Mock<IHostApplicationLifetime>();
 
@@ -154,6 +214,18 @@ public sealed class BackupServiceTests : IDisposable
             jellyfinDatabaseProvider.Object,
             applicationLifetime.Object,
             libraryManager.Object);
+    }
+
+    private static Mock<IJellyfinDatabaseProvider> CreateDatabaseProvider(
+        string providerKey,
+        DatabaseProviderCapabilities capabilities)
+    {
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider.SetupGet(p => p.ProviderKey).Returns(providerKey);
+        provider.SetupGet(p => p.Capabilities).Returns(capabilities);
+        provider.Setup(p => p.RunScheduledOptimisation(It.IsAny<CancellationToken>())).Returns(Task.CompletedTask);
+        provider.Setup(p => p.PurgeDatabase(It.IsAny<JellyfinDbContext>(), It.IsAny<System.Collections.Generic.IEnumerable<string>>())).Returns(Task.CompletedTask);
+        return provider;
     }
 
     private static BaseItemEntity CreateMovieEntity(Guid id, string name)

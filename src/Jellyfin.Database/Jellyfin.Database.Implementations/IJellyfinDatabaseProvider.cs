@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations.DbConfiguration;
@@ -12,6 +13,26 @@ namespace Jellyfin.Database.Implementations;
 /// </summary>
 public interface IJellyfinDatabaseProvider
 {
+    /// <summary>
+    /// Gets the stable identity of this provider for configuration and backup compatibility checks.
+    /// </summary>
+    /// <remarks>
+    /// The default keeps existing plugin providers compatible. New providers should override this member or apply
+    /// <see cref="JellyfinDatabaseProviderKeyAttribute"/> with a stable key.
+    /// </remarks>
+    string ProviderKey => GetType().GetCustomAttribute<JellyfinDatabaseProviderKeyAttribute>()?.DatabaseProviderKey
+        ?? GetType().FullName
+        ?? GetType().Name;
+
+    /// <summary>
+    /// Gets the optional operations supported by this provider.
+    /// </summary>
+    /// <remarks>
+    /// Existing plugin providers retain the behavior of the historical contract. New providers should explicitly
+    /// declare their capabilities.
+    /// </remarks>
+    DatabaseProviderCapabilities Capabilities => DatabaseProviderCapabilities.All;
+
     /// <summary>
     /// Gets or Sets the Database Factory when initialisaition is done.
     /// </summary>
@@ -68,7 +89,6 @@ public interface IJellyfinDatabaseProvider
     /// </summary>
     /// <param name="cancellationToken">A cancellation token.</param>
     /// <returns>A key to identify the backup.</returns>
-    /// <exception cref="NotImplementedException">May throw an NotImplementException if this operation is not supported for this database.</exception>
     Task<string> MigrationBackupFast(CancellationToken cancellationToken);
 
     /// <summary>
@@ -80,11 +100,34 @@ public interface IJellyfinDatabaseProvider
     Task RestoreBackupFast(string key, CancellationToken cancellationToken);
 
     /// <summary>
+    /// Restores a fast migration backup and reports provider-detected failures explicitly.
+    /// </summary>
+    /// <param name="key">The key to the backup from which the current database should be restored from.</param>
+    /// <param name="cancellationToken">A cancellation token.</param>
+    /// <returns>The result of the restore operation.</returns>
+    async Task<DatabaseProviderOperationResult> TryRestoreBackupFast(string key, CancellationToken cancellationToken)
+    {
+        await RestoreBackupFast(key, cancellationToken).ConfigureAwait(false);
+        return DatabaseProviderOperationResult.Success();
+    }
+
+    /// <summary>
     /// Deletes a backup that has been previously created by <see cref="MigrationBackupFast(CancellationToken)"/>.
     /// </summary>
     /// <param name="key">The key to the backup which should be cleaned up.</param>
     /// <returns>A <see cref="Task"/> representing the result of the asynchronous operation.</returns>
     Task DeleteBackup(string key);
+
+    /// <summary>
+    /// Deletes a fast migration backup and reports provider-detected failures explicitly.
+    /// </summary>
+    /// <param name="key">The key to the backup which should be cleaned up.</param>
+    /// <returns>The result of the delete operation.</returns>
+    async Task<DatabaseProviderOperationResult> TryDeleteBackup(string key)
+    {
+        await DeleteBackup(key).ConfigureAwait(false);
+        return DatabaseProviderOperationResult.Success();
+    }
 
     /// <summary>
     /// Removes all contents from the database.

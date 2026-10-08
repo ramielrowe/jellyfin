@@ -13,7 +13,8 @@ public class DatabaseConfigurationOptions
     public required string DatabaseType { get; set; }
 
     /// <summary>
-    /// Gets or sets the options required to use a custom database provider.
+    /// Gets or sets connection and provider-specific options. Built-in providers may use the connection string and
+    /// option list; plugin providers additionally use the plugin name and assembly.
     /// </summary>
     public CustomDatabaseOptions? CustomProviderOptions { get; set; }
 

@@ -2,11 +2,14 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using Emby.Server.Implementations;
 using Emby.Server.Implementations.Configuration;
 using Emby.Server.Implementations.Serialization;
 using Jellyfin.Database.Implementations;
+using Jellyfin.Database.Implementations.DbConfiguration;
+using Jellyfin.Database.Providers.Sqlite;
 using Jellyfin.Server.Implementations.DatabaseConfiguration;
 using Jellyfin.Server.Implementations.Extensions;
 using Jellyfin.Server.Migrations;
@@ -20,6 +23,7 @@ using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 using Xunit;
 
 namespace Jellyfin.Server.Tests.Migrations;
@@ -132,6 +136,30 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
         await CreateService().CheckFirstTimeRunOrMigration(_paths, new StartupOptions { RestoreArchive = Path.Combine(_root, "backup.zip") });
     }
 
+    [Fact]
+    public async Task PrepareSystemForMigration_WhenFastBackupIsUnsupported_StopsBeforeBackup()
+    {
+        var sqliteProvider = new SqliteDatabaseProvider(_paths, NullLogger<SqliteDatabaseProvider>.Instance);
+        var provider = new Mock<IJellyfinDatabaseProvider>();
+        provider.SetupGet(p => p.ProviderKey).Returns(DatabaseProviderKey.PostgreSql);
+        provider.SetupGet(p => p.Capabilities).Returns(DatabaseProviderCapabilities.None);
+        provider
+            .Setup(p => p.Initialise(It.IsAny<DbContextOptionsBuilder>(), It.IsAny<DatabaseConfigurationOptions>()))
+            .Callback<DbContextOptionsBuilder, DatabaseConfigurationOptions>(sqliteProvider.Initialise);
+        provider.Setup(p => p.OnModelCreating(It.IsAny<ModelBuilder>())).Callback<ModelBuilder>(sqliteProvider.OnModelCreating);
+        provider
+            .Setup(p => p.ConfigureConventions(It.IsAny<ModelConfigurationBuilder>()))
+            .Callback<ModelConfigurationBuilder>(sqliteProvider.ConfigureConventions);
+        var service = CreateService(provider.Object);
+
+        var exception = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => service.PrepareSystemForMigration(NullLogger<JellyfinMigrationService>.Instance));
+
+        Assert.Contains(DatabaseProviderKey.PostgreSql, exception.Message, StringComparison.Ordinal);
+        Assert.Contains("does not support the fast backup and restore operation", exception.Message, StringComparison.Ordinal);
+        provider.Verify(p => p.MigrationBackupFast(It.IsAny<CancellationToken>()), Times.Never);
+    }
+
     public void Dispose()
     {
         foreach (var serviceProvider in _serviceProviders)
@@ -155,16 +183,21 @@ public sealed class JellyfinMigrationServiceTests : IDisposable
         new MyXmlSerializer().SerializeToFile(new ServerConfiguration { IsStartupWizardCompleted = wizardCompleted }, _paths.SystemConfigurationFilePath);
     }
 
-    private JellyfinMigrationService CreateService()
+    private JellyfinMigrationService CreateService(IJellyfinDatabaseProvider? databaseProvider = null)
     {
         var configurationManager = new ServerConfigurationManager(_paths, NullLoggerFactory.Instance, new MyXmlSerializer());
         configurationManager.AddParts([new DatabaseConfigurationFactory()]);
-        var serviceProvider = new ServiceCollection()
+        var serviceCollection = new ServiceCollection()
             .AddLogging()
             .AddJellyfinDbContext(configurationManager, new ConfigurationBuilder().Build())
             .AddSingleton<IApplicationPaths>(_paths)
-            .RegisterStartupLogger()
-            .BuildServiceProvider();
+            .RegisterStartupLogger();
+        if (databaseProvider is not null)
+        {
+            serviceCollection.AddSingleton(databaseProvider);
+        }
+
+        var serviceProvider = serviceCollection.BuildServiceProvider();
         _serviceProviders.Add(serviceProvider);
 
         var factory = serviceProvider.GetRequiredService<IDbContextFactory<JellyfinDbContext>>();

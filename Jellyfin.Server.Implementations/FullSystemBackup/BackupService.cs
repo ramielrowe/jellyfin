@@ -93,8 +93,6 @@ public class BackupService : IBackupService
             throw new FileNotFoundException($"Requested backup file '{archivePath}' does not exist.");
         }
 
-        StorageHelper.TestCommonPathsForStorageCapacity(_applicationPaths, _logger);
-
         var fileStream = File.OpenRead(archivePath);
         await using (fileStream.ConfigureAwait(false))
         {
@@ -122,6 +120,9 @@ public class BackupService : IBackupService
             {
                 throw new NotSupportedException($"The loaded archive '{archivePath}' is made for a newer version of Jellyfin ({manifest.ServerVersion}) and cannot be loaded in this version.");
             }
+
+            ValidateDatabaseRestore(manifest, archivePath);
+            StorageHelper.TestCommonPathsForStorageCapacity(_applicationPaths, _logger);
 
             void CopyDirectory(string source, string target, string[]? exclude = null)
             {
@@ -265,6 +266,31 @@ public class BackupService : IBackupService
         return false;
     }
 
+    private void ValidateDatabaseRestore(BackupManifest manifest, string archivePath)
+    {
+        if (!manifest.Options.Database)
+        {
+            return;
+        }
+
+        if (!_jellyfinDatabaseProvider.Capabilities.HasFlag(DatabaseProviderCapabilities.FullSystemRestore))
+        {
+            throw new NotSupportedException(
+                $"Database provider '{_jellyfinDatabaseProvider.ProviderKey}' does not support full-system database restore. "
+                + "Restore the database using a provider-supported procedure or restore an archive without database contents.");
+        }
+
+        // Provider identity was added after the first full-system backup format. All older archives were produced by
+        // the only built-in provider at the time, SQLite.
+        var archiveProvider = manifest.DatabaseProvider ?? DatabaseProviderKey.Sqlite;
+        if (!string.Equals(archiveProvider, _jellyfinDatabaseProvider.ProviderKey, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new NotSupportedException(
+                $"The loaded archive '{archivePath}' contains a database backup for provider '{archiveProvider}', "
+                + $"but the configured provider is '{_jellyfinDatabaseProvider.ProviderKey}'. Cross-provider database restore is not supported.");
+        }
+    }
+
     /// <inheritdoc/>
     public async Task<BackupManifestDto> CreateBackupAsync(BackupOptionsDto backupOptions)
     {
@@ -276,10 +302,19 @@ public class BackupService : IBackupService
             throw new InvalidOperationException("Cannot create a backup while a library scan is running. Please try again once the scan has finished.");
         }
 
+        if (backupOptions.Database
+            && !_jellyfinDatabaseProvider.Capabilities.HasFlag(DatabaseProviderCapabilities.FullSystemBackup))
+        {
+            throw new NotSupportedException(
+                $"Database provider '{_jellyfinDatabaseProvider.ProviderKey}' does not support full-system database backup. "
+                + "Create a backup without database contents or use a provider-supported database backup procedure.");
+        }
+
         var manifest = new BackupManifest()
         {
             DateCreated = DateTime.UtcNow,
             ServerVersion = _applicationHost.ApplicationVersion,
+            DatabaseProvider = backupOptions.Database ? _jellyfinDatabaseProvider.ProviderKey : null,
             DatabaseTables = null!,
             BackupEngineVersion = _backupEngineVersion,
             Options = Map(backupOptions)
@@ -571,6 +606,7 @@ public class BackupService : IBackupService
         {
             BackupEngineVersion = manifest.BackupEngineVersion,
             DateCreated = manifest.DateCreated,
+            DatabaseProvider = manifest.DatabaseProvider,
             ServerVersion = manifest.ServerVersion,
             Path = path,
             Options = Map(manifest.Options)

@@ -23,6 +23,11 @@ public class BackupManifestDto
     public required DateTimeOffset DateCreated { get; set; }
 
     /// <summary>
+    /// Gets or sets the database provider that created the database portion of this backup.
+    /// </summary>
+    public string? DatabaseProvider { get; set; }
+
+    /// <summary>
     /// Gets or sets the path to the backup on the system.
     /// </summary>
     public required string Path { get; set; }

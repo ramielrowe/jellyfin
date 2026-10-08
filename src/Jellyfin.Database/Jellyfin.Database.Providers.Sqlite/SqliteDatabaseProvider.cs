@@ -19,7 +19,7 @@ namespace Jellyfin.Database.Providers.Sqlite;
 /// <summary>
 /// Configures jellyfin to use an SQLite database.
 /// </summary>
-[JellyfinDatabaseProviderKey("Jellyfin-SQLite")]
+[JellyfinDatabaseProviderKey(DatabaseProviderKey.Sqlite)]
 public sealed class SqliteDatabaseProvider : IJellyfinDatabaseProvider
 {
     private const string BackupFolderName = "SQLiteBackups";
@@ -39,6 +39,12 @@ public sealed class SqliteDatabaseProvider : IJellyfinDatabaseProvider
 
     /// <inheritdoc/>
     public IDbContextFactory<JellyfinDbContext>? DbContextFactory { get; set; }
+
+    /// <inheritdoc/>
+    public string ProviderKey => DatabaseProviderKey.Sqlite;
+
+    /// <inheritdoc/>
+    public DatabaseProviderCapabilities Capabilities => DatabaseProviderCapabilities.All;
 
     /// <inheritdoc/>
     public void Initialise(DbContextOptionsBuilder options, DatabaseConfigurationOptions databaseConfiguration)
@@ -313,34 +319,38 @@ public sealed class SqliteDatabaseProvider : IJellyfinDatabaseProvider
     }
 
     /// <inheritdoc />
-    public Task RestoreBackupFast(string key, CancellationToken cancellationToken)
+    public async Task RestoreBackupFast(string key, CancellationToken cancellationToken)
+    {
+        var result = await TryRestoreBackupFast(key, cancellationToken).ConfigureAwait(false);
+        if (!result.Succeeded)
+        {
+            _logger.LogCritical("{ErrorMessage}", result.ErrorMessage);
+        }
+    }
+
+    /// <inheritdoc />
+    public Task<DatabaseProviderOperationResult> TryRestoreBackupFast(string key, CancellationToken cancellationToken)
     {
         // ensure there are absolutely no dangling Sqlite connections.
         SqliteConnection.ClearAllPools();
-        var path = GetDatabasePath();
         var backupFile = Path.Combine(_applicationPaths.DataPath, BackupFolderName, $"{key}_jellyfin.db");
 
         if (!File.Exists(backupFile))
         {
-            _logger.LogCritical("Tried to restore a backup that does not exist: {Key}", key);
-            return Task.CompletedTask;
+            return Task.FromResult(DatabaseProviderOperationResult.Failure($"Cannot restore fast migration backup '{key}' because it does not exist."));
         }
 
+        var path = GetDatabasePath();
         if (!TryRetireWriteAheadLog(path))
         {
-            _logger.LogCritical(
-                "Refusing to restore jellyfin.db: the write-ahead log at {WriteAheadLog} could not be retired, which "
-                + "means the database is still open and replacing it now would silently bring back the data this "
-                + "rollback is undoing. Stop the server and copy {Backup} over {Path} by hand.",
-                path + "-wal",
-                backupFile,
-                path);
-            return Task.CompletedTask;
+            return Task.FromResult(DatabaseProviderOperationResult.Failure(
+                $"Refusing to restore jellyfin.db because the write-ahead log at '{path}-wal' could not be retired. "
+                + $"Stop the server and copy '{backupFile}' over '{path}' by hand."));
         }
 
         File.Copy(backupFile, path, true);
 
-        return Task.CompletedTask;
+        return Task.FromResult(DatabaseProviderOperationResult.Success());
     }
 
     private bool TryRetireWriteAheadLog(string path)
@@ -376,18 +386,27 @@ public sealed class SqliteDatabaseProvider : IJellyfinDatabaseProvider
     }
 
     /// <inheritdoc />
-    public Task DeleteBackup(string key)
+    public async Task DeleteBackup(string key)
+    {
+        var result = await TryDeleteBackup(key).ConfigureAwait(false);
+        if (!result.Succeeded)
+        {
+            _logger.LogCritical("{ErrorMessage}", result.ErrorMessage);
+        }
+    }
+
+    /// <inheritdoc />
+    public Task<DatabaseProviderOperationResult> TryDeleteBackup(string key)
     {
         var backupFile = Path.Combine(_applicationPaths.DataPath, BackupFolderName, $"{key}_jellyfin.db");
 
         if (!File.Exists(backupFile))
         {
-            _logger.LogCritical("Tried to delete a backup that does not exist: {Key}", key);
-            return Task.CompletedTask;
+            return Task.FromResult(DatabaseProviderOperationResult.Failure($"Cannot delete fast migration backup '{key}' because it does not exist."));
         }
 
         File.Delete(backupFile);
-        return Task.CompletedTask;
+        return Task.FromResult(DatabaseProviderOperationResult.Success());
     }
 
     private string GetDatabasePath()

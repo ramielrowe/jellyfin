@@ -96,14 +96,21 @@ public static class ServiceCollectionExtensions
                 // when nothing is setup via new Database configuration, fallback to SQLite with default settings.
                 efCoreConfiguration = new DatabaseConfigurationOptions()
                 {
-                    DatabaseType = "Jellyfin-SQLite",
+                    DatabaseType = DatabaseProviderKey.Sqlite,
                     LockingBehavior = DatabaseLockingBehaviorTypes.NoLock
                 };
                 configurationManager.SaveConfiguration("database", efCoreConfiguration);
             }
         }
 
-        if (efCoreConfiguration.DatabaseType.Equals("PLUGIN_PROVIDER", StringComparison.OrdinalIgnoreCase))
+        if (efCoreConfiguration.DatabaseType.Equals(DatabaseProviderKey.PostgreSql, StringComparison.OrdinalIgnoreCase)
+            && string.IsNullOrWhiteSpace(efCoreConfiguration.CustomProviderOptions?.ConnectionString))
+        {
+            throw new InvalidOperationException(
+                $"Database provider '{DatabaseProviderKey.PostgreSql}' requires a PostgreSQL connection string in database.xml at CustomProviderOptions.ConnectionString.");
+        }
+
+        if (efCoreConfiguration.DatabaseType.Equals(DatabaseProviderKey.Plugin, StringComparison.OrdinalIgnoreCase))
         {
             if (efCoreConfiguration.CustomProviderOptions is null)
             {
