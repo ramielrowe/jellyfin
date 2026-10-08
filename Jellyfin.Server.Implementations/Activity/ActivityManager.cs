@@ -79,22 +79,26 @@ public class ActivityManager : IActivityManager
 
             if (!string.IsNullOrEmpty(query.Name))
             {
-                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Name, $"%{query.Name}%"));
+                var name = $"%{query.Name.ToLowerInvariant()}%";
+                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Name.ToLower(), name));
             }
 
             if (!string.IsNullOrEmpty(query.Overview))
             {
-                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Overview, $"%{query.Overview}%"));
+                var overview = $"%{query.Overview.ToLowerInvariant()}%";
+                entries = entries.Where(e => e.ActivityLog.Overview != null && EF.Functions.Like(e.ActivityLog.Overview.ToLower(), overview));
             }
 
             if (!string.IsNullOrEmpty(query.ShortOverview))
             {
-                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.ShortOverview, $"%{query.ShortOverview}%"));
+                var shortOverview = $"%{query.ShortOverview.ToLowerInvariant()}%";
+                entries = entries.Where(e => e.ActivityLog.ShortOverview != null && EF.Functions.Like(e.ActivityLog.ShortOverview.ToLower(), shortOverview));
             }
 
             if (!string.IsNullOrEmpty(query.Type))
             {
-                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Type, $"%{query.Type}%"));
+                var type = $"%{query.Type.ToLowerInvariant()}%";
+                entries = entries.Where(e => EF.Functions.Like(e.ActivityLog.Type.ToLower(), type));
             }
 
             if (!query.ItemId.IsNullOrEmpty())
@@ -105,7 +109,8 @@ public class ActivityManager : IActivityManager
 
             if (!string.IsNullOrEmpty(query.Username))
             {
-                entries = entries.Where(e => EF.Functions.Like(e.Username, $"%{query.Username}%"));
+                var username = $"%{query.Username.ToLowerInvariant()}%";
+                entries = entries.Where(e => e.Username != null && EF.Functions.Like(e.Username.ToLower(), username));
             }
 
             if (query.Severity is not null)

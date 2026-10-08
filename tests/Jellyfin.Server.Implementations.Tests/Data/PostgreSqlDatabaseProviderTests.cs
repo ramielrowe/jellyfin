@@ -5,6 +5,7 @@ using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
 using Jellyfin.Database.Providers.PostgreSql;
 using Jellyfin.Database.Providers.PostgreSql.Migrations;
+using Jellyfin.Database.Providers.PostgreSql.ValueConverters;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
 using Microsoft.Extensions.Logging;
@@ -110,6 +111,33 @@ public class PostgreSqlDatabaseProviderTests
         Assert.Equal("Npgsql.EntityFrameworkCore.PostgreSQL", context.Database.ProviderName);
         var extension = context.GetService<IDbContextOptions>().Extensions.OfType<RelationalOptionsExtension>().Single();
         Assert.Equal(typeof(PostgreSqlDatabaseProvider).Assembly.GetName().Name, extension.MigrationsAssembly);
+    }
+
+    [Fact]
+    public void UtcDateTimeValueConverter_NormalizesUnspecifiedAndLocalValues()
+    {
+        var converter = new UtcDateTimeValueConverter();
+        var unspecified = new DateTime(2026, 4, 5, 6, 7, 8, DateTimeKind.Unspecified);
+        var local = new DateTime(2026, 4, 5, 6, 7, 8, DateTimeKind.Local);
+
+        Assert.Equal(
+            DateTime.SpecifyKind(unspecified, DateTimeKind.Utc),
+            Assert.IsType<DateTime>(converter.ConvertToProvider(unspecified)));
+        Assert.Equal(
+            local.ToUniversalTime(),
+            Assert.IsType<DateTime>(converter.ConvertToProvider(local)));
+    }
+
+    [Fact]
+    public void UtcDateTimeOffsetValueConverter_NormalizesOffset()
+    {
+        var converter = new UtcDateTimeOffsetValueConverter();
+        var withOffset = new DateTimeOffset(2026, 4, 5, 6, 7, 8, TimeSpan.FromHours(5));
+
+        var normalized = Assert.IsType<DateTimeOffset>(converter.ConvertToProvider(withOffset));
+
+        Assert.Equal(TimeSpan.Zero, normalized.Offset);
+        Assert.Equal(withOffset.UtcDateTime, normalized.UtcDateTime);
     }
 
     private static DatabaseConfigurationOptions CreateConfiguration(string connectionString)

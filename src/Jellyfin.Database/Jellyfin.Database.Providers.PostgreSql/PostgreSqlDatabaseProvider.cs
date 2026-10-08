@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Database.Implementations;
 using Jellyfin.Database.Implementations.DbConfiguration;
+using Jellyfin.Database.Providers.PostgreSql.ValueConverters;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 using Npgsql;
@@ -111,6 +112,15 @@ public sealed class PostgreSqlDatabaseProvider : IJellyfinDatabaseProvider
     /// <inheritdoc/>
     public void ConfigureConventions(ModelConfigurationBuilder configurationBuilder)
     {
+        // Jellyfin's persisted DateTime values represent UTC instants. Npgsql maps DateTime to
+        // timestamp with time zone and deliberately rejects Local/Unspecified values, so normalize
+        // them at the provider boundary while keeping the shared model provider-neutral.
+        configurationBuilder.Properties<DateTime>()
+            .HaveConversion<UtcDateTimeValueConverter>()
+            .HaveColumnType("timestamp with time zone");
+        configurationBuilder.Properties<DateTimeOffset>()
+            .HaveConversion<UtcDateTimeOffsetValueConverter>()
+            .HaveColumnType("timestamp with time zone");
     }
 
     /// <inheritdoc/>

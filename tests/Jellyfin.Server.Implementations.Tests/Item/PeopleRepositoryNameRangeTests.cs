@@ -50,4 +50,18 @@ public sealed class PeopleRepositoryNameRangeTests : SqliteDbTestFixture
         Assert.Equal(expected, result.Items.Select(p => p.Name));
         Assert.Equal(expected.Length, result.TotalRecordCount);
     }
+
+    [Theory]
+    [InlineData("BR", new[] { "Brad Pitt" })]
+    [InlineData("bo", new[] { "bob dylan" })]
+    public void GetPeople_NameStartsWith_IgnoresCase(string nameStartsWith, string[] expected)
+    {
+        var result = _repository.GetPeople(new InternalPeopleQuery
+        {
+            NameStartsWith = nameStartsWith
+        });
+
+        Assert.Equal(expected, result.Items.Select(person => person.Name));
+        Assert.Equal(expected.Length, result.TotalRecordCount);
+    }
 }
