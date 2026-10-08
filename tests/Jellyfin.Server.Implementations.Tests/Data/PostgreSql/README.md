@@ -53,11 +53,12 @@ Do not use production credentials or point this test harness at a production ser
 
 `ProviderBehaviorMatrixTests` is the shared SQLite/PostgreSQL persistence contract. Each test gets a clean schema and runs once per provider. It covers:
 
-- users, permissions, preferences, relationships, unique keys, and optimistic concurrency;
-- base-item and linked-child queries, empty/single/high-cardinality `WhereOneOrMany` inputs, partition boundaries, explicit null ordering, date ranges, paging, and bulk deletion;
-- people, item values, user data, nullable values, Unicode text, composite keys, and logical JSON serialization;
-- media streams and chapters, including ordered and null-valued fields;
-- activity-log service filtering, literal SQL `LIKE` metacharacters, date filters, paging, API keys, and devices;
-- transaction rollback and constraint enforcement.
+- `UserManager` policy/configuration persistence, normalized username uniqueness, permission/preference composite uniqueness, display-preference replacement, and optimistic concurrency;
+- `BaseItemRepository` query construction, exact ascending/descending null-last ordering (including ties), adjacent pages with total counts, parent filtering, and literal `%`, `_`, and backslash matching with wildcard decoys;
+- `PeopleRepository` credit deduplication and ordering plus complete people, item-value, and user-data relationship snapshots, including Unicode and nullable values;
+- `MediaStreamRepository` and `ChapterRepository` save, ordered read, replacement, deletion, failed-replacement rollback, obsolete-row removal, and preservation of another item's rows;
+- `ActivityManager` literal `LIKE`, date, exact ordering, adjacent paging, and total-count behavior; `AuthenticationManager` concurrent API-key creation/read/delete; and device-row round trips;
+- `ItemPersistenceService` deletion of 2,050 ids with duplicate and missing inputs, user-data deduplication, multi-table cleanup, and preservation of unrelated rows;
+- explicit transaction rollback, unique-constraint enforcement, and stale-write concurrency detection.
 
 The matrix compares observable behavior, not SQL text or engine internals. PostgreSQL-specific schema, migration, index-planner, and lifecycle contracts remain in the other tests in this directory. PostgreSQL intentionally does not support Jellyfin's SQLite file-copy fast migration backup or full-system database backup/restore; those operations require administrator-managed PostgreSQL backup tooling.
